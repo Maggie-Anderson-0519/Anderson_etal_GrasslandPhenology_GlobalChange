@@ -1,0 +1,3468 @@
+---
+title: "Anderson_etal2025_code"
+author: "Maggie Anderson"
+date: "2025-10-31"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+**Author(s):** Maggie Anderson
+ 
+**Overview:** this R script evaluates the TeRaCON phenology data using a generalized linear mixed effects modeling approach. It also runs code and plots raw data and coefficients for supplementary analyses
+
+[**Index**](#index)
+--
+  * [Setup](#setup): load in data/libraries and set working directory
+--- *The following three sections are not functional, but have been retained to show how raw data was manipulated. Will be updated to include raw data manipulations following publication* ---
+  * [Data prep](#prep): prep data for phenology calculations 
+  * [Phenology calculations](#phenoCalcs): phenology calculations; extract the first/last days of phenophase and length of phenophase time for each stage/subplot 
+  * [Data wrangling](#wrangle): add treatment information, check for inconsistencies, fix variable names 
+  * [Data structure](#str): investigate data structure
+  * [Fixed effects correlation](#fixed_corr): look at correlation of fixed effects in data frame
+  * [GDD & SPEI](#gdd_spei): extract SPEI and look at relationships between GDD and first dates of things 
+  * [Climate data wrangling](#climate): climate data wrangling and plotting
+  * [Correlation of response vars](#response_corr): how correlated are responses across phases, measures, and treatments? 
+  * [Interannual variability](#yr_effects): interannual variability effects on phenology
+  * [Model selection](#model_selection): selection for best-fit models, given interacting treatment effects
+  * [Model checks](#check_models): graph residuals, address model complexity and overfitting
+  * [Graph model predictions](#main_graphs): graph model means and SEs using predict()
+  * [Graph all treatment interactions (models)](#all_trt_graphs): graph model coefficients, but include ALL non-sig. interactions 
+  * [Climate info part 2](#gdd): calculate heat treatments effect on growing degree days
+  * [Species-level GDD graphs](#sps_gdd)
+  * [Species-level treatment effects](#sps_trt): main treatment effects (only) on individual species (regardless of year)
+  * [Species-level year effects](#sps_yr): year effects on individual species (regardless of treatment) 
+  * [Soil moisture graphs](#soil_m): visualize monthly soil moisture data during study
+--
+
+#### Setup: load in data/libraries and set working directory {#setup}
+```{r, message=FALSE, warning=FALSE}
+# clear workspace
+rm(list = ls()) # don't run if you have objects in your env. that you want to save
+graphics.off() 
+  
+# load in libraries
+ library(AICcmodavg) # model selection via AICc
+ library(car)        # test for multicollinearity
+ library(caret)      # cross-validation of results
+ library(corrplot)   # correlation plots
+ library(data.table) # as.data.table()
+ library(e1071)      # for checking skewness
+ library(emmeans)    # post-hoc analyses
+ library(ggpmisc)    # stat_poly_line()
+ library(ggpubr)     # ggarrange for multiple plots
+ library(ggthemes)   # nice-looking plots
+ library(gridExtra)  # arrange plots
+ library(lme4)       # models
+ library(lmerTest)   # wrapper for models
+ library(lubridate)  # coercing dates into workable formats
+ library(MuMIn)      # streamlined model selection
+ library(ncdf4)      # year conditions
+ library(nlme)       # get DF approximations from models
+ library(patchwork)  # arrange plots
+ library(performance)# detecting overdispersion
+ library(raster)     # year conditions
+ library(rstatix)    # normality tests
+ library(scales)     # extended graph capabilities
+ library(shadowtext) # display significance codes on plots
+ library(tidyverse)  # data wrangling, dplyr, ggplot2
+ library(usdm)       # check for multicollinearity
+ library(viridis)    # color scaling for ggplot
+
+# set working directory (wherever you uploaded your data after downloading from GitHub)
+# *your working directory here*
+
+# Daily climate summary data from on-site weather station
+weather <- read.csv("e080_DailyClimateSummary.csv")
+
+# Soil moisture data from TeRaCON
+sm <- read.csv("e141_SoilMoisture.csv")
+
+# Load e141 TeRaCON phenology data (2012-2021)
+df <- read.csv("TeRaCON_phenology_for_RM_210212.csv")
+
+# Load e141 phenology data (2021-2022)
+dfn <- read.csv("W2CONphenology2021-22.csv")
+
+# Load e141 TeRaCON phenology data (2023)
+df23 <- read.csv("W2CON_phenology_2023_COMPLETE.csv")
+
+# Treatment-level data
+dft <- read.csv("TeRaCON_treatments.csv")
+
+################################################################################
+# end setup
+```
+[Back to Index](#index)
+
+#### Prep data for phenology calculations {#prep}
+```{r}
+# Change NAs to 0 
+  df[is.na(df)] <- 0
+  df[,8:25] <- lapply(df[,8:25], as.factor)
+
+# Reformat to data table (otherwise code below doesn't run)
+df <- as.data.table(df)
+
+# fix misspelling of agrre
+df$Species.observed <- as.factor(ifelse(df$Species.observed == "aggre", "agrre",df$Species.observed))
+      df.gap <- df # save for later gap analysis
+
+# Clean up 2021-2022 data
+  # which species are in the 2021/22 dataset that aren't in 2012-19 dataset
+  unique(df$Species.observed)
+  unique(dfn$Species) # we added all the forb species in 2021 & 2022
+  
+# Replace spaces in 2023 df with periods in all column names
+names(df23) <- gsub(" ", ".", names(df23))
+# remove some unnecessary columns in df23
+df23_corrected1 <- df23 %>% dplyr::select(-c(`Year.Day`, Sampling.., X,))
+# rename species column
+df23_corrected2 <- df23_corrected1 %>% rename(Species = Species.observed)
+# Reorder columns so that Plot comes before Ring
+df23_corrected <- df23_corrected2[, c(1, 2, 4, 3, 5:ncol(df23_corrected2))]
+
+# Combine data from both datasets (collection protocols are the same)
+  # 2021
+  df21_22_23 <- bind_rows(dfn, df23_corrected) # formerly df23_partial
+    
+  dfn1 <- df21_22_23 %>% # replaced dfn with df21_22_23
+    dplyr::rename(Species.observed = Species) %>%   # First, change "Species" column to "Species.observed"
+    mutate(Species.observed = ifelse(Species.observed == "aggre", "agrre",Species.observed)) %>% # fix misspelling of agrre
+    filter(Species.observed %in% c("agrre","luppe","solri","broin","lesca","schsc","andge","poapr")) %>% # trim species from 2021/22 dataset that aren't in 2012-19 dataset
+    dplyr::select(-c(OpenFlowerCount_WholePlot))  %>% # remove this column (we're not using this for now)
+    replace(is.na(.), 0) %>% # replace NAs with zero
+    mutate(Ring = as.integer(Ring),
+           Plot = as.integer(Plot),
+           Species.observed = as.factor(Species.observed))
+    
+  # Add column to dfn for day of the year
+  dfn1$Year.Day <- as.Date(dfn1$Date, "%m/%d/%Y")
+  dfn1$Year.Day <- as.integer(format(as.POSIXct(dfn1$Year.Day,format='%m/%d/%Y'),format='%j'))
+  
+  # Keep last N characters in string to get date alone
+  dfn1$Year <- as.integer(str_sub(dfn1$Date, start=-4))
+  
+  # Change all phenophase columns to factors (this is essential for the next chunk to run)
+  dfn1[,5:22] <- lapply(dfn1[,5:22], as.factor)
+  
+# stack columns together
+  df <- bind_rows(df, dfn1)
+  
+# Finish changes to original dataframe
+  # Create unique column incorporating Year, Ring, Plot, Species
+  df <- df %>%
+    unite("Unique", c(Year, Ring, Plot, Species.observed))
+  df$Unique <- as.factor(df$Unique)
+  
+# end prep
+```
+[Back to Index](#index)
+
+#### Phenology calculations: extract the first/last days of phenophase and length of phenophase time for each stage/subplot {#phenoCalcs}
+    # Contributors: Ben Tomhave (MN DOT) 
+```{r}
+# Group Df into many unique df one each for each unique value group
+groupedDfList <- split(df, df$Unique)
+
+possiblePhases <- list('Initial.Growth.subplot.1',
+                       'Initial.Growth.subplot.2',
+                       'Initial.Growth.subplot.3',
+                       'Leaves.subplot.1',
+                       'Leaves.subplot.2',
+                       'Leaves.subplot.3',
+                       'Flower.subplot.1',
+                       'Flower.subplot.2',
+                       'Flower.subplot.3',
+                       'Open.Flowers.subplot.1',
+                       'Open.Flowers.subplot.2',
+                       'Open.Flowers.subplot.3',
+                       'Fruits.subplot.1',
+                       'Fruits.subplot.2',
+                       'Fruits.subplot.3',
+                       'Ripe.Fruits.subplot.1',
+                       'Ripe.Fruits.subplot.2',
+                       'Ripe.Fruits.subplot.3')
+
+# Create blank output vectors
+output_UniqueCharacter <- c()
+output_StartDate <- c()
+output_EndDate <- c()
+output_Phase <- c()
+
+# For each "Unique" df loop to find start and end dates
+for (singleGroup in groupedDfList){
+  singleGroup <- data.table(singleGroup)
+  
+  # For each phase, extract if two 1s in a row 
+  for(Phase in possiblePhases) {
+    
+    # Identify start and end dates for specified column where column binary is 1 N times in a row
+    outcome <- singleGroup[, if(.N > 1 & all(get(Phase) == 1)) .(starts = first(.I),
+                                                                     ends = last(.I)),
+                         by = rleid(get(Phase))] # Phase = string saved as variable, get converts the "Phase" variable back into a string
+  
+    # If there is data present in that column then output dates
+    if (nrow(outcome) != 0){
+      firstPatternDataOnly <- outcome[1, ] # Only Take first pattern occurrence if multiple
+      # Get Start and End Dates
+      startIndex <- as.numeric(firstPatternDataOnly[, starts])
+      endIndex <- as.numeric(firstPatternDataOnly[, ends])
+      startDate <- singleGroup[c(startIndex), Year.Day]
+      endDate <- singleGroup[c(endIndex), Year.Day]
+
+      
+      # Get "Unique" Character Name
+      uniqueVal <- as.character(singleGroup[c(endIndex), Unique])
+      
+      # Export Three Relevant Columns to Vectors to later be joined into df
+      output_UniqueCharacter <- c(output_UniqueCharacter, uniqueVal)
+      output_StartDate <- c(output_StartDate, startDate)
+      output_EndDate <- c(output_EndDate, endDate)
+      output_Phase <- c(output_Phase, Phase)
+    }
+    }
+}
+
+# # Combine three output lists above into a df
+VALIDATION <- data.frame(output_UniqueCharacter, output_Phase, output_StartDate, output_EndDate)
+# 
+# # Separate Unique Into Multiple Columns and rename columns to match existing method
+dff <- VALIDATION %>%
+      dplyr::rename(Unique = output_UniqueCharacter)%>%
+      dplyr::rename(start  = output_StartDate)%>%
+      dplyr::rename(end    = output_EndDate)%>%
+      dplyr::rename(Phase  = output_Phase) %>%
+      separate(Unique, c("Year","Ring","Plot","Species.observed"), "_") %>%
+      separate(Phase, c("Phase", "Subplot"), ".subplot.")
+
+# Make new cols for phase length and phase midpoint
+dff$length <- dff$end - dff$start
+dff$midpt <- dff$length/2 + dff$start
+
+# Validation: we can use the commented code below to test if our data has been compiled correctly
+# TESTING
+#  test <- data.table(df) %>%
+#    filter(Unique == "2012_2_106_andge")
+#  outcomeTest <- test[, if(.N > 1 & all(Leaves.subplot.2 == 1)) .(starts = first(.I),
+#                                                                       ends = last(.I)),
+#                           by = rleid(Leaves.subplot.2)][1, ]
+#  
+#  startIndex <- as.numeric(outcomeTest[, starts])
+#  endIndex <- as.numeric(outcomeTest[, ends])
+# # 
+#  startDate <- test[c(startIndex), Year.Day]
+#  endDate <- test[c(endIndex), Year.Day]
+#  print(c(startDate, endDate))
+
+# end phenoCalcs
+```
+[Back to Index](#index)
+
+#### Data wrangling --add treatments, check for inconsistencies, fix variable names {#wrangle}
+```{r}
+# Take means across subplots and convert to long format
+dff <- dff %>%
+  group_by(Year, Ring, Plot, Species.observed, Phase) %>%
+  dplyr::select(-Subplot) %>% # take this out so that we can summarise
+      summarise_all(funs(mean(., na.rm = TRUE))) %>%
+      pivot_longer(cols = start:midpt,
+                   names_to = "Measure",
+                   values_to = "YearDay") 
+
+# Random fixes
+
+# new column w/ grass vs. forb info (we don't use this in the analysis, but it's helpful for keeping track of species)
+dff$Life.form <- ifelse(dff$Species.observed == "agrre" |
+                          dff$Species.observed == "andge" |
+                          dff$Species.observed == "broin" |
+                          dff$Species.observed == "poapr" |
+                          dff$Species.observed == "schsc", "Grass",
+                        ifelse(dff$Species.observed == "luppe" |
+                                 dff$Species.observed == "lesca" |
+                                 dff$Species.observed == "solri", "Forb", NA))
+
+dff[,2:3] <- lapply(dff[,2:3], as.integer) # convert class of Ring and Plot variables
+
+dff <- left_join(dff, dft[,c(1:4,6,8)], by = c("Ring","Plot")) 
+
+# fill blanks in water treatment column (should be H2O ambient)
+dff$Water.Treatment <- ifelse(dff$Water.Treatment == "","H2Oamb",dff$Water.Treatment)
+
+# create new column with all possible treatment combinations
+dff$ClmTrt <- as.factor(ifelse(dff$Water.Treatment == "H2Oamb" & dff$Temp.Treatment == "HTamb", "Control",
+                     ifelse(dff$Water.Treatment == "H2Oneg" & dff$Temp.Treatment == "HTamb","-Water",
+                            ifelse(dff$Water.Treatment == "H2Oamb" & dff$Temp.Treatment == "HTelv" | dff$Plot == 226, "+Heat",
+                                   ifelse(dff$Water.Treatment == "H2Oneg" & dff$Temp.Treatment == "HTelv","+Heat-Water",NA)))))
+
+# Convert YearDay to an integer
+dff$YearDay <- as.integer(dff$YearDay)
+  dff.info <- dff %>% # save for later
+      mutate(Plot = as.character(Plot),
+             Ring = as.character(Ring))
+  
+dff.allPhases <- dff %>% # keep for looking and flower and fruit maturation
+  filter(Year != 2012)
+
+# apply filters to main dataframe
+dff <- dff %>%
+  filter(Phase != "Initial.Growth") %>%
+  filter(Phase != "Flower") %>%
+  filter(Phase != "Fruits") %>%
+  mutate(Phase = ifelse(Phase == "Open.Flowers","Open flowers",
+                         ifelse(Phase == "Ripe.Fruits","Ripe fruits",Phase))) 
+
+# reorder factors for plotting
+   dff$Measure <- factor(dff$Measure, levels = c("start","midpt","end","length"))
+   dff$Phase <- factor(dff$Phase, levels = c("Leaves","Open flowers","Ripe fruits"))
+   dff$ClmTrt <- factor(dff$ClmTrt, levels = c("Control","-Water","+Heat","+Heat-Water"))
+
+length(unique(dff$Plot)) # 48 unique plots
+
+# Take out midpt and end, since these are highly correlated with start and length
+dff <- dff %>%
+# Add experiment year to dataframe
+  mutate(ExpYr = -(2011-as.numeric(Year))) %>%
+  rename(N.Treatment = Ntreatment,
+         CO2.Treatment = CO2Treatment) # rename some cols for consistency
+
+# plot model coefficients (we don't use this in the analysis, but it's helpful for reference)
+{      dff.mod <- dff %>%
+        dplyr::mutate(ExpYrCat = as.factor(Year)) 
+      # leaf start by species
+          model.sps.s.le <- lmer(YearDay ~ ExpYrCat * Species.observed + (1|Ring), data = subset(dff.mod, CO2.Treatment == "AC" & N.Treatment == "AN" & Water.Treatment == "H2Oamb" & Temp.Treatment == "HTamb" & Measure == "start" & Phase == "Leaves"))
+      # flower start by species
+          model.sps.s.fl <- lmer(YearDay ~ ExpYrCat * Species.observed + (1|Ring), data = subset(dff.mod, CO2.Treatment == "AC" & N.Treatment == "AN" & Water.Treatment == "H2Oamb" & Temp.Treatment == "HTamb" & Measure == "start" & Phase == "Open flowers"))
+      # fruit start by species
+          model.sps.s.fr <- lmer(YearDay ~ ExpYrCat * Species.observed + (1|Ring), data = subset(dff.mod, CO2.Treatment == "AC" & N.Treatment == "AN" & Water.Treatment == "H2Oamb" & Temp.Treatment == "HTamb" & Measure == "start" & Phase == "Ripe fruits"))
+          
+      # leaf end by species
+          model.sps.l.le <- lmer(YearDay ~ ExpYrCat * Species.observed + (1|Ring), data = subset(dff.mod, CO2.Treatment == "AC" & N.Treatment == "AN" & Water.Treatment == "H2Oamb" & Temp.Treatment == "HTamb" & Measure == "end" & Phase == "Leaves"))
+      # flower end by species
+          model.sps.l.fl <- lmer(YearDay ~ ExpYrCat * Species.observed + (1|Ring), data = subset(dff.mod, CO2.Treatment == "AC" & N.Treatment == "AN" & Water.Treatment == "H2Oamb" & Temp.Treatment == "HTamb" & Measure == "end" & Phase == "Open flowers"))
+      # fruit end by species
+          model.sps.l.fr <- lmer(YearDay ~ ExpYrCat * Species.observed + (1|Ring), data = subset(dff.mod, CO2.Treatment == "AC" & N.Treatment == "AN" & Water.Treatment == "H2Oamb" & Temp.Treatment == "HTamb" & Measure == "end" & Phase == "Ripe fruits"))}
+
+# Function to extract emmeans and SE from models
+extract_emmeans <- function(model) {
+  emmeans_output <- emmeans(model, ~ ExpYrCat * Species.observed)
+  summary_output <- summary(emmeans_output)
+  return(summary_output)
+}
+
+# Models
+models <- list(
+  model.sps.s.le = model.sps.s.le,
+  model.sps.s.fl = model.sps.s.fl,
+  model.sps.s.fr = model.sps.s.fr,
+  model.sps.l.le = model.sps.l.le,
+  model.sps.l.fl = model.sps.l.fl,
+  model.sps.l.fr = model.sps.l.fr
+)
+
+# Extract emmeans and SE for each model
+emmeans_list <- lapply(models, extract_emmeans)
+
+# Combine results into a data frame
+results <- do.call(rbind, lapply(names(emmeans_list), function(name) {
+  data.frame(Model = name, emmeans_list[[name]])
+}))
+
+# Custom labels for the models
+model_labels <- c(
+  model.sps.s.le = "Leaf Start",
+  model.sps.s.fl = "Flower Start",
+  model.sps.s.fr = "Fruit Start",
+  model.sps.l.le = "Leaf End",
+  model.sps.l.fl = "Flower End",
+  model.sps.l.fr = "Fruit End"
+)
+
+# Desired order of the model levels
+model_order <- c("model.sps.s.le", "model.sps.s.fl", "model.sps.s.fr", "model.sps.l.le", "model.sps.l.fl", "model.sps.l.fr")
+
+# Reorder the levels of the Model variable
+results$Model <- factor(results$Model, levels = model_order)
+
+# Custom vector for the new facet labels
+species_labels <- c(
+  agrre = "italic('E. repens')",
+  andge = "italic('A. gerardii')",
+  broin = "italic('B. inermis')",
+  lesca = "italic('L. capitata')",
+  luppe = "italic('L. perennis')",
+  poapr = "italic('P. pratensis')",
+  schsc = "italic('S. scoparium')"
+)
+# Sort the labels alphabetically
+species_labels <- species_labels[order(names(species_labels))]
+
+
+# Plotting with custom facet labels
+# Update the ggplot code
+ggplot(results, aes(y = ExpYrCat, x = emmean, xmin = emmean - SE, xmax = emmean + SE, color = ExpYrCat)) +
+  geom_pointrange(size = 0.15) +
+  facet_grid(Species.observed ~ Model, labeller = labeller(Species.observed = as_labeller(species_labels, label_parsed), Model = as_labeller(model_labels)), scales = "free") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Model", x = "Day of the Year (start) / (end)", y = element_blank(), color = "Year") +
+  scale_color_viridis(option = "H", discrete = TRUE) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 12),
+    axis.title = element_text(size = 12),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.text = element_text(size = 8),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10)
+  )
+
+df <- as.data.frame(dff) # new dataframe version
+
+# means and sds across all species
+sum.tbl <- df %>%
+  group_by(ExpYr,Phase,Measure,Life.form,Water.Treatment,Temp.Treatment,CO2.Treatment,N.Treatment) %>% # means and sds across all species
+  summarise(n=n(),
+            mean=mean(YearDay),
+            sd=sd(YearDay)) # MIA: added ExpYr
+
+df <- df %>%
+  mutate(Phase = ifelse(Phase == "Open flowers", "OpenFlowers",
+                        ifelse(Phase == "Ripe fruits", "RipeFruits", 
+                               ifelse(Phase == "Leaves", "Leaves", NA)))) # change reproductive phase names for coding ease
+
+# here I make a column called "trait" which is a combination of phase and life form (this is useful later)
+df2 <- df %>% # used to be df2
+  pivot_wider(names_from = Measure,values_from = YearDay) %>% mutate(trait = paste(Life.form,Phase, sep = "_")) %>% 
+
+# make sure only the 48 treated plots are used
+  drop_na(Temp.Treatment, Water.Treatment, CO2.Treatment, N.Treatment)
+
+unique_plots <- data.frame(sort(unique(df2$Plot))); dim(unique_plots)
+
+# random sidequest: fix labels
+df2$CO2.Treatment <- factor(df2$CO2.Treatment, levels = c("AC", "EC"), 
+                  labels = c("ambient CO2", "+CO2"))
+df2$N.Treatment <- factor(df2$N.Treatment, levels = c("AN", "EN"),
+                  labels = c("ambient N", "+N")
+                  )
+
+# Add categorical variable for experimental ring, year, & plot
+df2 <- df2 %>%
+  dplyr::mutate(ExpYrCat = as.factor(ExpYr),
+                Ring = as.factor(Ring),
+                Plot = as.factor(Plot))
+
+ # end wrangle
+```
+[Back to Index](#index)
+
+#### Investigate data structure (response variation/data normality) {#str}
+```{r, message=FALSE, warning=FALSE, fig.width=8, fig.height=8}
+# remember that I elected to throw out RipeFruits based on the correlation matrix generated in Part 1
+# start   
+    ggplot(df2, aes(x = start)) +
+      geom_density(aes(color = Phase, fill = Phase), 
+                     position = "identity", alpha = 0.4) +
+      scale_color_brewer(palette = "Set1", direction = -1) +
+      scale_fill_brewer(palette = "Set1", direction = -1) +
+      labs(x = "Start of phase (DOY)", subtitle = "Phase start distribution by species") +
+      facet_wrap(~Species.observed, scales = "free") +
+      theme_few() 
+# end  
+    ggplot(df2, aes(x = end)) +
+      geom_density(aes(color = Phase, fill = Phase), 
+                     position = "identity", alpha = 0.4) +
+      scale_color_brewer(palette = "Set1", direction = -1) +
+      scale_fill_brewer(palette = "Set1", direction = -1) +
+      labs(x = "End of phase (days)", subtitle = "Phase end distribution by species") +
+      facet_wrap(~Species.observed) +
+      theme_few()
+    
+# test for normality within groups
+    norm1 <- df2 %>%
+      group_by(Phase, Species.observed) %>%
+      shapiro_test(start,end,midpt) %>%
+      mutate(action = ifelse(p < 0.05, "non-normal",""));print(norm1,n=32) # p-value > 0.05 would imply that the distribution of the data are not significantly different from normal distribution
+      # ^^ most of these data categories could benefit from data transformations
+    
+    norm2 <- df2 %>%
+      group_by(Phase, Species.observed) %>%
+      mutate(start.log = log(start),
+             end.log = log(end),
+             midpt.log = log(midpt)) %>%
+      shapiro_test(start.log,end.log) %>%
+      mutate(action = ifelse(p < 0.05, "non-normal",""));print(norm2,n=32)
+    # log transformations do not change the normality of the data distributions overly much...
+    
+# end structure investigation
+```
+[Back to Index](#index)
+
+#### look at correlation of fixed effects in data frame {#fixed_corr}
+It is important to understand which variables are most correlated with each other. This will help us decide whether to keep them in the model. In general, I am following the guideline that a correlation is considered strong in ecology when |r| > 0.7. 
+ * Source: David N. Chapter 6—Selection of Variables and Factor Derivation. Commercial data mining: Processing, analysis and modeling for predictive analytics projects. 2014:79-104.
+```{r, message=FALSE, warning=FALSE, fig.width=10, fig.height=8}
+# make dataframe for correlation matrix
+# correlation regardless of species (otherwise we have NAs in dataframe)
+# ONLY CONTROL PLOTS
+df.corr <- df2 %>% # remove treatment/ring information and a redundant column for now 
+  as.data.frame() %>%
+  dplyr::filter(Water.Treatment == "H2Oamb" &
+                Temp.Treatment == "HTamb" &
+                CO2.Treatment == "ambient CO2" &
+                N.Treatment == "ambient N") %>% # only use data from control plots
+  dplyr::select(Ring, Plot, Species.observed, Phase, ExpYr, start, end) %>%
+  mutate(start = as.numeric(start),
+         end = as.numeric(end)) %>%
+  pivot_longer(cols = start:end, names_to = "Measure",values_to = "value") %>%
+  dplyr::group_by(ExpYr, Ring, Plot, Species.observed) %>%
+  pivot_wider(names_from = c(Phase,Measure),values_from = value, values_fn = mean) %>%
+  ungroup() %>%
+  dplyr::select(-c(ExpYr, Ring, Plot, Species.observed)) # now we need to remove our grouping columns (except ExpYr because this is a ifixed effect) before we test for correlations
+  
+# calculate correlation matrix
+cor_matrix <- cor(df.corr, use='pairwise.complete.obs') 
+
+# Calculate the correlation matrix
+    # Here, "pairwise.complete.obs" computes the correlation or covariance between each pair of variables using only the complete pairs of observations. This means that if there are missing values for some observations, those pairs will be excluded from the calculation. However, this can lead to incomplete correlation matrices, and in some cases, it can result in NA entries if there are no complete pairs for a pair of variables.
+
+corrplot(cor_matrix, type = "upper",
+         method = "square",
+         addCoef.col = "black",
+         tl.col = "black", tl.srt = 45,
+         main = "
+         Correlation of Phases and Measures (control plots, all years)")
+
+# To be sure, let's test multicollinearity using the VIF function
+# Generally if VIF > 4, then we assume that the variables are correlated
+    df.mcl <- df2 %>%
+      #filter(Life.form == "Forb") %>%
+      dplyr::select(-c(trait,midpt,Water.Treatment,Temp.Treatment,CO2.Treatment,N.Treatment,Life.form)) %>% # we don't need this column for vif
+      group_by(ExpYr,Ring,Plot,Species.observed) %>% # dataframe into wide format
+      pivot_wider(names_from = Phase, values_from = c(end,start)) %>%
+      as.data.frame()
+
+    df2.backup <- df2 # maybe useful later
+    
+# end fixed effects correlation
+```
+[Back to Index](#index)
+
+#### extract SPEI and look at relationships between GDD and first dates of things {#gdd_spei}
+```{r}
+##############
+# SPEI data
+##############
+    
+    # load in the new SPEI dataframe
+    # Use nc_open to read the data into a data structure I called nc_data. Print the metadata about this file to a text file.
+    our_nc_data <- nc_open("spei04_45.5_-93.2.nc") #took out: G:/My Drive/Chapter2_phenology/Rcode&data/
+    print(our_nc_data)
+    
+    attributes(our_nc_data$var)
+    attributes(our_nc_data$dim)
+    
+    lat <- ncvar_get(our_nc_data, "lat") # need data for 45.25
+    nlat <- dim(lat) #to check it matches the metadata: 23
+    lon <- ncvar_get(our_nc_data, "lon") # need data for -93.25
+    nlon <- dim(lon) #to check (is this number of grid cells?)
+    nlon
+    
+    # Find the indices for the desired latitude and longitude
+    lat_index <- which(lat == 45.25) 
+    lon_index <- which(lon == -93.25) 
+    
+    # Extract the "spei" variable
+    spei_data <- ncvar_get(our_nc_data, "spei")
+    fill_value <- ncatt_get(our_nc_data, "spei", "_FillValue")$value
+    
+    # Extract the "spei" data for the specific location
+    spei_specific <- spei_data[lon_index, lat_index, ]
+    spei_specific[spei_specific == fill_value] <- NA
+    
+    # Extract the time variable and its units
+    time <- ncvar_get(our_nc_data, "time")
+    tunits <- ncatt_get(our_nc_data, "time", "units")$value
+    print(tunits)
+    
+    # Convert the time variable to a readable date format
+    # The time units are "days since 1900-1-1"
+    time_origin <- as.Date("1900-01-01")
+    time_dates <- as.Date(time, origin = time_origin)
+    
+    # Combine the time and "spei" values into a dataframe
+    spei_df <- data.frame(
+      Date = time_dates,
+      SPEI = spei_specific
+    )
+    
+    # Print the dataframe
+    print(spei_df)
+    
+    
+    # Add separate columns for year, month, and day
+    spei_df <- spei_df %>%
+      mutate(
+        Year = as.numeric(format(Date, "%Y")),
+        Month = as.numeric(format(Date, "%m")),
+        Day = as.numeric(format(Date, "%d"))
+      ) %>%
+      filter(SPEI != is.na(SPEI)) %>%
+      # filter to only get years we're interested in
+      filter(Year %in% c(2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023))
+    
+    # Close the NetCDF file
+    nc_close(our_nc_data)
+    
+    # wrangle
+    spei1.1 <- spei_df %>% 
+      data.frame() %>%
+      dplyr::filter(Month == 8) # Month formerly set to "Aug"
+    
+    spei1.1$SPEI_4cat <- "Normal"
+    qnorm(c(0.1,0.25,0.75,0.9)) #norm function provides the quantile of the normal distribution at a specified cumulative density (Isbell et al. 2015, Nature)
+    
+    spei1.1$SPEI_4cat[spei1.1$SPEI >= 1.2815516] <- "Extremely wet" 
+    spei1.1$SPEI_4cat[spei1.1$SPEI >= 0.6744898 & spei1.1$SPEI < 1.2815516] <- "Wet"
+    spei1.1$SPEI_4cat[spei1.1$SPEI <= -1.2815516] <- "Extremely dry"
+    spei1.1$SPEI_4cat[spei1.1$SPEI < -0.6744898 & spei1.1$SPEI > -1.2815516] <- "Dry"
+    
+    unique(spei1.1$SPEI_4cat) # simplify these categories
+    spei2 <- spei1.1 %>%
+      mutate(status = ifelse(SPEI_4cat == "Normal","Normal",
+                             ifelse(SPEI_4cat == "Dry" | SPEI_4cat == "Extremely dry","Dry",
+                                    ifelse(SPEI_4cat == "Wet" | SPEI_4cat == "Extremely wet","Wet",NA))),
+             severity = ifelse(SPEI_4cat == "Normal","Normal",
+                               ifelse(SPEI_4cat == "Moderately wet" | SPEI_4cat == "Moderately dry","Moderate",
+                                      ifelse(SPEI_4cat == "Extremely wet" | SPEI_4cat == "Extremely dry","Extreme","None")))) %>%
+      rename(SPEI04 = SPEI) %>%
+      mutate(Year = as.character(Year)) %>%
+      rename(event = status)
+    
+    # look at data
+    head(spei2) 
+# end GDD prep and SPEI extraction
+```
+[Back to Index](#index)
+
+#### climate data wrangling and plotting {#climate}
+```{r}
+head(weather)
+
+# Convert the DATE column to Date format
+weather <- weather %>%
+  mutate(Date = as.Date(Date, format = "%m/%d/%Y"))
+
+# Exclude the year 2019 from the dataset
+weather_filtered <- weather %>%
+  filter(year(Date) != 2020) %>%
+  filter(year(Date) > 2011 & year(Date) < 2024) %>%
+  # change temp to degrees C and precip to mm
+  dplyr::mutate(MaxTemp.degC. = (MaxTemp.degF.- 32)*5/9,
+                MinTemp.degC. = (MinTemp.degF.- 32)*5/9,
+                Precip.mm. = Precip.inches.*25.4)
+
+# Define a function to calculate GDD
+calculate_gdd <- function(MinTemp.degC., MaxTemp.degC., base_temp = 10) {
+  MinTemp.degC. <- ifelse(MinTemp.degC. < base_temp, base_temp, MinTemp.degC.)
+  MaxTemp.degC. <- ifelse(MaxTemp.degC. < base_temp, base_temp, MaxTemp.degC.)
+  gdd <- ((MaxTemp.degC. + MinTemp.degC.) / 2) - base_temp
+  return(max(gdd, 0))
+}
+
+# Calculate GDD and GDD with temperature treatment for each day
+weather_gdd <- weather_filtered %>%
+  mutate(GDD = mapply(calculate_gdd, MinTemp.degC., MaxTemp.degC.),
+         ) # precipitation treatment
+
+# 1. Create a dataset with cumulative GDD and total precipitation by year
+cumulative_gdd_year <- weather_gdd %>%
+  group_by(Year = year(Date)) %>%
+  summarize(Cumulative_GDD = sum(GDD, na.rm = TRUE),
+            Total_Precipitation_mm = sum(Precip.mm., na.rm = TRUE) 
+            ) %>%
+  arrange(Year) %>%
+  dplyr::mutate(ExpYrCat = as.factor(-(2011-Year)))
+
+
+# add to df2
+df2 <- df2 %>%
+  left_join(., spei2[,c("Year", "SPEI04","event")], by = "Year")
+
+# end cliamte data wrangle
+```
+[Back to Index](#index)
+
+#### How correlated are responses across phases, measures, and treatments? {#response_corr}
+I want to spend time digging thoroughly into the correlations between the start and end of leafing, flowering, and fruiting (think a correlation figure with 6 panels). Rather than seeing these correlated variables as an inconvenience, I want to lean into them.*Note: this section is not included in the main analyses, but provides useful context*
+```{r}
+# first, make data subsets based on these troublesome models:
+flower_start <- df2 %>% filter(Phase == "OpenFlowers") %>% drop_na(start) %>% mutate(ExpYrCat = as.factor(ExpYr))
+    flower_start_mod <- lmer(start ~ Temp.Treatment * Water.Treatment * CO2.Treatment * N.Treatment - (Temp.Treatment: Water.Treatment:CO2.Treatment:N.Treatment) - (Temp.Treatment: Water.Treatment:CO2.Treatment) - (Temp.Treatment: Water.Treatment:N.Treatment) - (Temp.Treatment: CO2.Treatment:N.Treatment) - (Water.Treatment:CO2.Treatment:N.Treatment)+ (1|ExpYrCat) + (1|Ring) +  (1|Species.observed), data = flower_start)
+    
+flower_end <- df2 %>% filter(Phase == "OpenFlowers") %>% drop_na(end) %>% mutate(ExpYrCat = as.factor(ExpYr))
+        flower_end_mod <- lmer(end ~ Temp.Treatment * Water.Treatment * CO2.Treatment * N.Treatment- (Temp.Treatment: Water.Treatment:CO2.Treatment:N.Treatment) - (Temp.Treatment: Water.Treatment:CO2.Treatment) - (Temp.Treatment: Water.Treatment:N.Treatment) - (Temp.Treatment: CO2.Treatment:N.Treatment) - (Water.Treatment:CO2.Treatment:N.Treatment) + (1|ExpYrCat) + (1|Ring/Plot) +  (1|Species.observed), data = flower_end)
+        
+fruit_end <- df2 %>% filter(Phase == "RipeFruits") %>% drop_na(end) %>% mutate(ExpYrCat = as.factor(ExpYr))
+        fruit_end_mod <- lmer(end ~ Temp.Treatment * Water.Treatment * CO2.Treatment * N.Treatment + (1+SPEI04|ExpYrCat) + (1|Ring/Plot) + (1|Plot/Species.observed), data = fruit_end)
+
+# 1) Check for unbalanced species/treatment combinations
+    print("flower_start")
+    table(flower_start$Temp.Treatment, flower_start$Water.Treatment, flower_start$CO2.Treatment, flower_start$N.Treatment, flower_start$Species.observed) # no major trt holes (lowest is 52), but several sps holes (7)
+    
+    print("flower_end")
+    table(flower_end$Temp.Treatment, flower_end$Water.Treatment, flower_end$CO2.Treatment, flower_end$N.Treatment, flower_end$Species.observed) # ALSO no major holes (lowest is 52), but lots of sps holes (17)
+    
+    print("fruit_end")
+    table(fruit_end$Temp.Treatment, fruit_end$Water.Treatment, fruit_end$CO2.Treatment, fruit_end$N.Treatment, fruit_end$Species.observed) # ALSO no major holes (lowest is 63), but lots of sps holes (15)
+    
+    
+# 2) Check for SPEI04 imbalances
+      # Eight levels are minimal but often sufficient for estimating a random slope. However, this depends on how balanced these levels are across ExpYrCat. 
+      # If one level of SPEI04 dominates or corresponds to only one level of ExpYrCat, it can destabilize the model.
+    table(flower_start$SPEI04, flower_start$ExpYrCat)
+    table(flower_end$SPEI04, flower_end$ExpYrCat)
+    table(fruit_end$SPEI04, fruit_end$ExpYrCat) # yeah this is ALL super unevenly distributed
+
+# 3) Check for convergence or singularity in models
+    print("flower_start")
+    summary(flower_start_mod)  # Look for "boundary (singular) fit" warnings.
+    isSingular(flower_start_mod, tol = 1e-05)  # TRUE if singular.  
+    
+    print("flower_end")
+    summary(flower_end_mod)  # Look for "boundary (singular) fit" warnings.
+    isSingular(flower_end_mod, tol = 1e-05)  # TRUE if singular.
+    
+    print("fruit_end")
+    summary(fruit_end_mod)  # Look for "boundary (singular) fit" warnings.
+    isSingular(fruit_end_mod, tol = 1e-05)  # TRUE if singular.
+
+    # both end models have a singular fit
+    
+    # If singularity occurs, I need to consider simplifying random effects. For example, remove the random slope (1 + SPEI04 | ExpYrCat) or collapse levels of random effects like Species.observed.
+    
+# 4) To detect issues with Species.observed decline, create a cross-tabulation of species by year:
+    print("flower_start")
+    table(flower_start$Species.observed, flower_start$ExpYrCat)
+    print("flower_end")
+    table(flower_end$Species.observed, flower_end$ExpYrCat)
+    print("fruit_end")
+    table(fruit_end$Species.observed, fruit_end$ExpYrCat)
+    
+# 5) Multicollinearity might inflate DoF. Use variance inflation factors (VIFs) to check:
+    library(car)
+    vif(lmer(start ~ Temp.Treatment * Water.Treatment * CO2.Treatment * N.Treatment - (Temp.Treatment: Water.Treatment:CO2.Treatment:N.Treatment) - (Temp.Treatment: Water.Treatment:CO2.Treatment) - (Temp.Treatment: Water.Treatment:N.Treatment) - (Temp.Treatment: CO2.Treatment:N.Treatment) - (Water.Treatment:CO2.Treatment:N.Treatment) + (1 + SPEI04 | ExpYrCat) + (1|Ring) +  (1|Species.observed), data = flower_start))
+    vif(lmer(end ~ Temp.Treatment * Water.Treatment * CO2.Treatment * N.Treatment - (Temp.Treatment: Water.Treatment:CO2.Treatment:N.Treatment) - (Temp.Treatment: Water.Treatment:CO2.Treatment) - (Temp.Treatment: Water.Treatment:N.Treatment) - (Temp.Treatment: CO2.Treatment:N.Treatment) - (Water.Treatment:CO2.Treatment:N.Treatment) + (1 + SPEI04 | ExpYrCat) + (1|Ring) +  (1|Species.observed), data = flower_end))
+    vif(lmer(end ~ Temp.Treatment * Water.Treatment * CO2.Treatment * N.Treatment - (Temp.Treatment: Water.Treatment:CO2.Treatment:N.Treatment) - (Temp.Treatment: Water.Treatment:CO2.Treatment) - (Temp.Treatment: Water.Treatment:N.Treatment) - (Temp.Treatment: CO2.Treatment:N.Treatment) - (Water.Treatment:CO2.Treatment:N.Treatment) + (1 + SPEI04 | ExpYrCat) + (1|Ring) +  (1|Species.observed), data = fruit_end))
+    
+# 6) Remember that missing levels in higher-order interactions can inflate DoF due to overparameterization. Check which levels are missing:
+    print("flower_start")
+    xtabs(~ Temp.Treatment + Water.Treatment + CO2.Treatment + N.Treatment + ExpYrCat + Species.observed, data = flower_start)
+    print("flower_end")
+    xtabs(~ Temp.Treatment + Water.Treatment + CO2.Treatment + N.Treatment + ExpYrCat + Species.observed, data = flower_end)
+    print("fruit_end")
+    xtabs(~ Temp.Treatment + Water.Treatment + CO2.Treatment + N.Treatment + ExpYrCat + Species.observed, data = fruit_end)
+
+```
+
+#### check the type, distribution, and skewness of response variables {#variable_checks}
+# How do we decide what type of model to use?
+# transform end varible 
+```{r}
+# Check if the data is count-based or continuous
+is_count_data_start <- all(df2$start == floor(df2$start)) # TRUE if all values are integers
+is_count_data_end <- all(df2$end == floor(df2$end))
+cat("Start variable is count data:", is_count_data_start, "\n")
+cat("End variable is count data:", is_count_data_end, "\n") 
+    # it's count data, so we this limits the types of distributions we're able to use
+
+# Histogram to inspect distribution
+par(mfrow = c(1,2))
+hist(df2$start, breaks = 15, col = "skyblue", main = "Start Variable", xlab = "start")
+hist(df2$end, breaks = 15, col = "lightcoral", main = "End Variable", xlab = "end")
+par(mfrow = c(1,1))
+
+# Shapiro-Wilk test for normality (sensitive for larger datasets)
+shapiro.test(df2$start[1:500])  # Subset to 500 to avoid errors for large datasets
+shapiro.test(df2$end[1:500])
+# If p < 0.05, the data significantly deviates from normality, favoring glmer().
+# p-values < 2.2e-16, confirming non-normality.
+
+# Quantify skewness
+cat("Skewness (Start):", skewness(df2$start), "\n") # positive, mild but not extreme
+cat("Skewness (End):", skewness(df2$end), "\n") # negative, more concerning
+# Interpretation:
+    # Right-skewed: Positive skewness = Poisson, Gamma, or Negative Binomial.
+    # Left-skewed: Negative skewness = Consider zero-inflated or transformation-based models.
+
+# both variables are non-normal, meaning that a glmer is a better option than an lmer, since glmer can better account for different data distributions
+# HOWEVER, there are not a lot of good ways to handle the left-skewed data that we see with the "end" response. That said, we can transform the "end" variable relative to the last day of the year instead of the first to address this issue:
+df2$end_rev <- 1*(365- df2$end)
+hist(df2$end_rev, breaks = 20, col = "tomato1", main = "End Variable (relative to Dec. 31st)", xlab = "end")
+df2$sqrt_end_rev <- sqrt(df2$end_rev + 1)  # Add 1 to avoid log(0)
+df2$sqrt_end_rev <- sqrt(df2$end_rev + 1)  # Add 1 to avoid log(0)
+hist(df2$sqrt_end_rev, breaks = 20, col = "cornflowerblue", main = "End Variable (relative to Dec. 31st)", xlab = "end")
+
+# Response Variable Nature: Both start and end are count data, confirmed using:
+all(df2$start == floor(df2$start))
+all(df2$end == floor(df2$end))
+# end response variable checks 
+```
+[Back to Index](#index)
+
+#### interannual variability effects on phenology {#yr_effects}
+*Note: this chunk takes a long time to run*
+```{r}
+# start of leaves
+yr_effects_start_leaves <- glmer(start ~ Temp.Treatment*ExpYrCat + Water.Treatment*ExpYrCat + CO2.Treatment*ExpYrCat + N.Treatment*ExpYrCat + (1|Ring:Plot:Species.observed), data = subset(df2, Phase == "Leaves"), family = poisson)
+            check_overdispersion(yr_effects_start_leaves) # good
+            car::vif(yr_effects_start_leaves) # good
+            anova(yr_effects_start_leaves) 
+            Anova(yr_effects_start_leaves) # massive effect of year.
+            emms <- emmeans(yr_effects_start_leaves, ~ Temp.Treatment | ExpYrCat);pairs(emms) 
+            # lme for DF approximation
+            yr_start_leaves_preds_lme <- lme(
+                  fixed = start ~ Temp.Treatment*ExpYrCat + Water.Treatment*ExpYrCat + CO2.Treatment*ExpYrCat + N.Treatment*ExpYrCat,
+                  random = list(Species.observed = ~1, Ring = ~1 | Plot),
+                  data = subset(df2, Phase == "Leaves")
+                );anova(yr_start_leaves_preds_lme)
+            
+# start of flowers     
+yr_effects_start_flowers <- glmer(start ~ Temp.Treatment*ExpYrCat + Water.Treatment*ExpYrCat + CO2.Treatment*ExpYrCat + N.Treatment*ExpYrCat + (1|Ring:Plot:Species.observed), data = subset(df2, Phase == "OpenFlowers"), family = poisson)
+            check_overdispersion(yr_effects_start_flowers) # good
+            car::vif(yr_effects_start_flowers) # good
+            anova(yr_effects_start_flowers) 
+            Anova(yr_effects_start_flowers) # massive year effect
+            # lme for DF approximation
+            yr_start_flowers_preds_lme <- lme(
+                  fixed = start ~ Temp.Treatment*ExpYrCat + Water.Treatment*ExpYrCat + CO2.Treatment*ExpYrCat + N.Treatment*ExpYrCat,
+                  random = list(Species.observed = ~1, Ring = ~1 | Plot),
+                  data = subset(df2, Phase == "OpenFlowers")
+                );anova(yr_start_flowers_preds_lme)
+
+# start of fruits          
+yr_effects_start_fruits <- glmer(start ~ Temp.Treatment*ExpYrCat + Water.Treatment*ExpYrCat + CO2.Treatment*ExpYrCat + N.Treatment*ExpYrCat + (1|Ring:Plot:Species.observed), data = subset(df2, Phase == "RipeFruits"), family = poisson)
+            check_overdispersion(yr_effects_start_fruits) # good
+            car::vif(yr_effects_start_fruits) # good 
+            anova(yr_effects_start_fruits) 
+            Anova(yr_effects_start_fruits)
+            # lme for DF approximation
+            yr_start_fruits_preds_lme <- lme(
+                  fixed = start ~ Temp.Treatment*ExpYrCat + Water.Treatment*ExpYrCat + CO2.Treatment*ExpYrCat + N.Treatment*ExpYrCat,
+                  random = list(Species.observed = ~1, Ring = ~1 | Plot),
+                  data = subset(df2, Phase == "RipeFruits")
+                );anova(yr_start_fruits_preds_lme)
+            
+# end of leaves
+yr_effects_end_leaves <- glmer(sqrt_end_rev ~ Temp.Treatment*ExpYrCat + Water.Treatment*ExpYrCat + CO2.Treatment*ExpYrCat + N.Treatment*ExpYrCat + (1|Ring:Plot:Species.observed), data = subset(df2, Phase == "Leaves"), family = Gamma(link = "log")) 
+            car::vif(yr_effects_end_leaves) 
+            anova(yr_effects_end_leaves) 
+            Anova(yr_effects_end_leaves) 
+            # lme for DF approximation
+            yr_end_leaves_preds_lme <- lme(
+                  fixed = sqrt_end_rev ~ Temp.Treatment*ExpYrCat + Water.Treatment*ExpYrCat + CO2.Treatment*ExpYrCat + N.Treatment*ExpYrCat,
+                  random = list(Species.observed = ~1, Ring = ~1 | Plot),
+                  data = subset(df2, Phase == "Leaves")
+                );anova(yr_end_leaves_preds_lme)
+# end of flowers
+yr_effects_end_flowers <- glmer(sqrt_end_rev ~ Temp.Treatment*ExpYrCat + Water.Treatment*ExpYrCat + CO2.Treatment*ExpYrCat + N.Treatment*ExpYrCat + (1|Ring:Plot:Species.observed), data = subset(df2, Phase == "OpenFlowers"), family = Gamma(link = "log")) 
+            car::vif(yr_effects_end_flowers) 
+            anova(yr_effects_end_flowers) 
+            Anova(yr_effects_end_flowers) 
+            # lme for DF approximation
+            yr_end_flowers_preds_lme <- lme(
+                  fixed = sqrt_end_rev ~ Temp.Treatment*ExpYrCat + Water.Treatment*ExpYrCat + CO2.Treatment*ExpYrCat + N.Treatment*ExpYrCat,
+                  random = list(Species.observed = ~1, Ring = ~1 | Plot),
+                  data = subset(df2, Phase == "OpenFlowers")
+                );anova(yr_end_flowers_preds_lme)
+# end of fruits
+yr_effects_end_fruits <- glmer(sqrt_end_rev ~ Temp.Treatment*ExpYrCat + Water.Treatment*ExpYrCat + CO2.Treatment*ExpYrCat + N.Treatment*ExpYrCat + (1|Ring:Plot:Species.observed), data = subset(df2, Phase == "RipeFruits"), family = Gamma(link = "log")) 
+            car::vif(yr_effects_end_flowers) 
+            anova(yr_effects_end_flowers) # effect of elevated CO2 despite year
+            Anova(yr_effects_end_flowers) 
+            # lme for DF approximation
+            yr_end_fruits_preds_lme <- lme(
+                  fixed = sqrt_end_rev ~ Temp.Treatment*ExpYrCat + Water.Treatment*ExpYrCat + CO2.Treatment*ExpYrCat + N.Treatment*ExpYrCat,
+                  random = list(Species.observed = ~1, Ring = ~1 | Plot),
+                  data = subset(df2, Phase == "RipeFruits")
+                );anova(yr_end_fruits_preds_lme)
+            
+# visualize residuals
+    par(mfrow = c(2,3))
+    plot(yr_effects_start_leaves, main = "Residuals: Start/Leaves + Year, Poisson")
+    plot(yr_effects_start_flowers, main = "Residuals: Start/Flowers + Year, Poisson")
+    plot(yr_effects_start_fruits, main = "Residuals: Start/Fruits + Year, Poisson")
+    
+    plot(yr_effects_end_leaves, main = "Residuals: End/Leaves + Year, Gamma")
+    plot(yr_effects_end_flowers, main = "Residuals: End/Flowers + Year, Gamma")
+    plot(yr_effects_end_fruits, main = "Residuals: End/Fruits + Year, Gamma")
+    par(mfrow = c(1,1))
+
+# EXTRACT AND PLOT TREATMENT EFFECTS
+get_treatment_effects <- function(model, measure, phase) {
+  # make newdat (same structure for all models)
+  newdat <- expand.grid(
+    Temp.Treatment  = c("HTamb", "HTelv"),
+    Water.Treatment = "H2Oamb",
+    CO2.Treatment   = "ambient CO2",
+    N.Treatment     = "ambient N",
+    ExpYrCat        = levels(df2$ExpYrCat)
+  ) %>% mutate(Treatment_Combo = "Temp") %>%
+    
+    bind_rows(expand.grid(
+      Temp.Treatment  = "HTamb",
+      Water.Treatment = c("H2Oamb", "H2Oneg"),
+      CO2.Treatment   = "ambient CO2",
+      N.Treatment     = "ambient N",
+      ExpYrCat        = levels(df2$ExpYrCat)
+    ) %>% mutate(Treatment_Combo = "Water")) %>%
+    
+    bind_rows(expand.grid(
+      Temp.Treatment  = "HTamb",
+      Water.Treatment = "H2Oamb",
+      CO2.Treatment   = c("ambient CO2", "+CO2"),
+      N.Treatment     = "ambient N",
+      ExpYrCat        = levels(df2$ExpYrCat)
+    ) %>% mutate(Treatment_Combo = "CO2")) %>%
+    
+    bind_rows(expand.grid(
+      Temp.Treatment  = "HTamb",
+      Water.Treatment = "H2Oamb",
+      CO2.Treatment   = "ambient CO2",
+      N.Treatment     = c("ambient N", "+N"),
+      ExpYrCat        = levels(df2$ExpYrCat)
+    ) %>% mutate(Treatment_Combo = "N"))
+  
+  # design matrix
+  fixed_formula <- reformulate(attr(terms(model), "term.labels"))
+  X   <- model.matrix(fixed_formula, newdat)
+  beta <- fixef(model)
+  vcv  <- vcov(model)
+  
+  # predictions
+  newdat$linpred <- as.vector(X %*% beta)
+  newdat$se_linpred <- sqrt(diag(X %*% vcv %*% t(X)))
+  newdat$predicted <- exp(newdat$linpred)
+  newdat$se_predicted <- newdat$predicted * newdat$se_linpred
+  
+  # treatment effects
+  newdat %>%
+    group_by(Treatment_Combo, ExpYrCat) %>%
+    summarise(
+      control_linpred = linpred[1],
+      treated_linpred = linpred[2],
+      diff_linpred = treated_linpred - control_linpred,
+      ratio = exp(diff_linpred),
+      se_diff_linpred = {
+        Xg <- X[cur_group_rows(), , drop = FALSE]
+        cvec <- Xg[2, ] - Xg[1, ]
+        sqrt(as.vector(cvec %*% vcv %*% cvec))
+      },
+      Measure = measure,
+      Phase   = phase,
+      .groups = "drop"
+    )
+}
+
+# now loop through your models + labels
+models <- list(
+  list(model = yr_effects_start_leaves,   measure = "start", phase = "Leaves"),
+  list(model = yr_effects_start_flowers,  measure = "start", phase = "OpenFlowers"),
+  list(model = yr_effects_start_fruits,   measure = "start", phase = "RipeFruits"),
+  list(model = yr_effects_end_leaves,     measure = "end",   phase = "Leaves"),
+  list(model = yr_effects_end_flowers,    measure = "end",   phase = "OpenFlowers"),
+  list(model = yr_effects_end_fruits,     measure = "end",   phase = "RipeFruits")
+)
+
+# apply function to each and bind results
+treatment_effects_all <- purrr::map_dfr(models, ~get_treatment_effects(.x$model, .x$measure, .x$phase))
+
+# PLOT TREATMENT EFFECTS
+# Step 0: List the Models & Variables that are Significant in Each Model
+    anova(yr_effects_start_leaves) # sig year effect
+    anova(yr_effects_start_flowers) # sig year effect
+    anova(yr_effects_start_fruits) # sig year effect
+  
+    anova(yr_effects_end_leaves) # sig year effect
+    anova(yr_effects_end_flowers) # sig year effect
+    anova(yr_effects_end_fruits) # sig year effect
+    
+    # Make ANOVA table out of predicts output
+    yr_effects_start_leaves_aov <- data.frame(Anova(yr_effects_start_leaves)[3], anova(yr_effects_start_leaves)[4]); yr_effects_start_leaves_aov <- yr_effects_start_leaves_aov %>% mutate(Measure = rep("start"), Phase = rep("Leaves"))
+    yr_effects_start_flowers_aov <- data.frame(Anova(yr_effects_start_flowers)[3], anova(yr_effects_start_flowers)[4]); yr_effects_start_flowers_aov <- yr_effects_start_flowers_aov %>% mutate(Measure = rep("start"), Phase = rep("OpenFlowers"))
+    yr_effects_start_fruits_aov <- data.frame(Anova(yr_effects_start_fruits)[3], anova(yr_effects_start_fruits)[4]); yr_effects_start_fruits_aov <- yr_effects_start_fruits_aov %>% mutate(Measure = rep("start"), Phase = rep("RipeFruits"))
+    
+    yr_effects_end_leaves_aov <- data.frame(Anova(yr_effects_end_leaves)[3], anova(yr_effects_end_leaves)[4]); yr_effects_end_leaves_aov <- yr_effects_end_leaves_aov %>% mutate(Measure = rep("end"), Phase = rep("Leaves"))
+    yr_effects_end_flowers_aov <- data.frame(Anova(yr_effects_end_flowers)[3], anova(yr_effects_end_flowers)[4]); yr_effects_end_flowers_aov <- yr_effects_end_flowers_aov %>% mutate(Measure = rep("end"), Phase = rep("OpenFlowers"))
+    yr_effects_end_fruits_aov <- data.frame(Anova(yr_effects_end_fruits)[3], anova(yr_effects_end_fruits)[4]); yr_effects_end_fruits_aov <- yr_effects_end_fruits_aov %>% mutate(Measure = rep("end"), Phase = rep("RipeFruits"))
+    
+    # bind
+    aov_preds <- bind_rows(yr_effects_start_leaves_aov,
+                           yr_effects_start_flowers_aov,
+                           yr_effects_start_fruits_aov,
+                           yr_effects_end_leaves_aov,
+                           yr_effects_end_flowers_aov,
+                           yr_effects_end_fruits_aov)
+    # add significance codes
+    aov_preds <- aov_preds %>% mutate(Significance = ifelse(Pr..Chisq. < 0.001, "***",
+                                                            ifelse(Pr..Chisq. < 0.01, "**", 
+                                                                   ifelse(Pr..Chisq. < 0.05, "*", 
+                                                                          ifelse(Pr..Chisq. < 0.1, ".", ""))))) %>%
+      # create row names for join to preds dataframe (below)
+      rownames_to_column(var = "rowname") %>%
+      mutate(Treatment_Combo = case_when(
+        grepl("Temp", rowname) ~ "Warming",
+        grepl("Water", rowname) ~ "-W",
+        grepl("N", rowname) ~ "+N",
+        grepl("CO2", rowname) ~ "+C",
+        TRUE ~ ""
+      )) %>%
+      mutate(Treatment_Combo = paste0(
+        ifelse(grepl("Temp", rowname), "+T", ""),
+        ifelse(grepl("Water", rowname), "-W", ""),
+        ifelse(grepl("N", rowname), "+N", ""),
+        ifelse(grepl("CO2", rowname), "+C", "")
+      )) %>%
+      column_to_rownames(var = "rowname") %>%
+      mutate(Treatment_Combo = ifelse(Treatment_Combo == "+N+C", "+C+N", Treatment_Combo)) %>%
+      # Add ExpYrCat to rows if applicable
+      mutate(
+        Treatment_Combo = if_else(
+          grepl("ExpYrCat", rownames(.)),  # Check if row name contains "ExpYrCat"
+          if_else(
+            Treatment_Combo == "",         # If Treatment_Combo is empty
+            "ExpYrCat",                    # Just insert "ExpYrCat"
+            paste0(Treatment_Combo, " :ExpYrCat")  # Otherwise, append it
+          ),
+          Treatment_Combo                 # If row name doesn't contain "ExpYrCat", leave as is
+        ),
+        Treatment_Combo = ifelse(Treatment_Combo == "ExpYrCat", "Ctrl :ExpYrCat", Treatment_Combo)
+      )
+    
+    aov_preds$Treatment_Combo <- gsub("ExpYrCat", " Year", aov_preds$Treatment_Combo)
+      
+    # check out DFs via AICs
+    AICc(yr_effects_start_leaves,
+         yr_effects_start_flowers,
+         yr_effects_start_fruits,
+         yr_effects_end_leaves,
+         yr_effects_end_flowers,
+         yr_effects_end_fruits)
+    
+    aov_preds_exp <- aov_preds %>%
+      dplyr::select(Measure, Phase, Treatment_Combo, F.value, Pr..Chisq., Significance) %>%
+      rename(p.value = Pr..Chisq.)
+
+    # print out model statistics
+    print(aov_preds_exp)
+    # Unlike linear mixed models (lmer), generalized linear mixed models (glmer) do not directly compute denominator degrees of freedom (DF). This is because glmer uses maximum likelihood (ML) or restricted maximum likelihood (REML) estimation, which does not inherently assign DF to fixed effects.
+
+# Step 1: Generate a New Datasets for Predictions
+    # Create a new datasets for predictions
+    newdat <- expand.grid(
+          Temp.Treatment = c("HTamb", "HTelv"),
+          Water.Treatment = c("H2Oamb", "H2Oneg"),
+          CO2.Treatment = c("ambient CO2", "+CO2"),
+          N.Treatment = c("ambient N", "+N"),
+          ExpYrCat = c("1", "2", "3", "4", "5", "6", "7", "8", "10", "11", "12")
+        ) %>% # now we can tailor this dataset 
+        mutate(
+        # add treatment combo column
+        Treatment_Combo = case_when(
+          Temp.Treatment == "HTelv" & Water.Treatment == "H2Oamb" & CO2.Treatment == "ambient CO2" & N.Treatment == "ambient N" ~ "+T",
+          Temp.Treatment == "HTamb" & Water.Treatment == "H2Oneg" & CO2.Treatment == "ambient CO2" & N.Treatment == "ambient N" ~ "-W",
+          Temp.Treatment == "HTamb" & Water.Treatment == "H2Oamb" & CO2.Treatment == "+CO2" & N.Treatment == "ambient N" ~ "+C",
+          Temp.Treatment == "HTamb" & Water.Treatment == "H2Oamb" & CO2.Treatment == "ambient CO2" & N.Treatment == "+N" ~ "+N",
+          Temp.Treatment == "HTamb" & Water.Treatment == "H2Oamb" & CO2.Treatment == "ambient CO2" & N.Treatment == "ambient N" ~ "Ctrl", # All ambient
+          TRUE ~ paste0(
+            ifelse(Temp.Treatment == "HTelv", "+T", ""),
+            ifelse(Water.Treatment == "H2Oneg", "-W", ""),
+            ifelse(CO2.Treatment == "+CO2", "+C", ""),
+            ifelse(N.Treatment == "+N", "+N", "")
+          )
+        )
+      ) %>%
+      # remove instances of 3 & 4-way interactions
+      mutate(
+        non_ambient_count = rowSums(data.frame(
+          Temp.Treatment != "HTamb",
+          Water.Treatment != "H2Oamb",
+          CO2.Treatment != "ambient CO2",
+          N.Treatment != "ambient N"
+        ))
+      ) %>%
+      filter(non_ambient_count <= 2) %>% # Keep only rows with <= 2 non-ambient variables
+      dplyr::select(-non_ambient_count) # Drop the helper column
+    
+# Step 2: Generate specific datasets for models
+    # START OF LEAVES
+    # Significant: Temp.Treatment, Temp.Treatment:N.Treatment (added N.Treatment by itself too...)
+    newdat_yr_effects_start_leaves <- newdat %>%
+      # filter to get specific instances we're testing with this response
+      filter(Treatment_Combo %in% c("Ctrl", "+T", "-W", "+C", "+N"))
+    
+    # START OF FLOWERS
+    # Significant: Temp.Treatment 
+    newdat_yr_effects_start_flowers <- newdat %>%
+      # filter to get specific instances we're testing with this response
+      filter(Treatment_Combo %in% c("Ctrl", "+T", "-W", "+C", "+N"))
+    
+    # START OF FRUITS
+    # Significant: Temp.Treatment, Water.Treatment
+    newdat_yr_effects_start_fruits <- newdat %>%
+      # filter to get specific instances we're testing with this response
+      filter(Treatment_Combo %in% c("Ctrl", "+T", "-W", "+C", "+N"))
+    
+    # END OF LEAVES
+    # Significant: Temp.Treatment:CO2.Treatment (added Temp.Treatment and CO2.Treatment by themselves too...)
+    newdat_yr_effects_end_leaves <- newdat %>%
+      # filter to get specific instances we're testing with this response
+      filter(Treatment_Combo %in% c("Ctrl", "+T", "-W", "+C", "+N"))# %>% # Formerly:  "Ctrl", "+T", "+T+C", "+C"
+      # fix bug
+      #mutate(Treatment_Combo = ifelse(Treatment_Combo == "+C+N", "+N+C",Treatment_Combo))
+    
+    # END OF FLOWERS
+    # Significant: Water.Treatment 
+    newdat_yr_effects_end_flowers <- newdat %>%
+      # filter to get specific instances we're testing with this response
+      filter(Treatment_Combo %in% c("Ctrl", "+T", "-W", "+C", "+N")) # formerly "Ctrl", "-W"
+    
+    # END OF FRUITS
+    # Significant: none, but each variable is included separately for kicks
+    newdat_yr_effects_end_fruits <- newdat %>%
+      # filter to get specific instances we're testing with this response
+      filter(Treatment_Combo %in% c("Ctrl", "+T", "-W", "+C", "+N"))  
+
+# Step 3: Extract predictors and standard errors (RUN IN SEQUENCE!!!!)
+    # START OF LEAVES
+    # Generate Model Matrix for New Data
+    fixed_formula <- reformulate(attr(terms(yr_effects_start_leaves), "term.labels"))  # Extract fixed effects formula
+    X <- model.matrix(fixed_formula, newdat_yr_effects_start_leaves)  # Generate model matrix
+    # Extract Fixed Effect Estimates and Variance-Covariance Matrix
+    beta_hat <- fixef(yr_effects_start_leaves)  # Fixed effects
+    vcov_beta <- vcov(yr_effects_start_leaves)  # Covariance matrix
+    # Compute Predictions and Standard Errors
+    link_predictions <- X %*% beta_hat  # Predictions on link scale
+    link_se <- sqrt(diag(X %*% vcov_beta %*% t(X)))  # Standard errors
+    # Store Predictions in Dataframe
+    newdat_start_leaves1 <- newdat_yr_effects_start_leaves %>%
+      mutate(
+        link_se = exp(link_se),
+        predicted = exp(link_predictions),  # Poisson uses log-link, so exp() transforms predictions back
+        lower = exp(link_predictions - 1.96 * link_se),  # Confidence interval lower bound
+        upper = exp(link_predictions + 1.96 * link_se),  # Confidence interval upper bound
+        Measure = "start",  # Label for Measure
+        Phase = "Leaves"  # Label for Phase
+      )
+      # Verify Predictions Using predict()
+      newdat_start_leaves1 <- newdat_start_leaves1 %>%
+        mutate(
+          predict_check = predict(yr_effects_start_leaves, newdata = newdat_yr_effects_start_leaves, type = "response", re.form = NA)
+        ) %>%
+        dplyr::select(ExpYrCat,Treatment_Combo,Measure,Phase,predicted, link_se) 
+      
+    # START OF FLOWERS
+    # Generate Model Matrix for New Data
+    fixed_formula <- reformulate(attr(terms(yr_effects_start_flowers), "term.labels"))  # Extract fixed effects formula
+    X <- model.matrix(fixed_formula, newdat_yr_effects_start_flowers)  # Generate model matrix
+    # Extract Fixed Effect Estimates and Variance-Covariance Matrix
+    beta_hat <- fixef(yr_effects_start_flowers)  # Fixed effects
+    vcov_beta <- vcov(yr_effects_start_flowers)  # Covariance matrix
+    # Compute Predictions and Standard Errors
+    link_predictions <- X %*% beta_hat  # Predictions on link scale
+    link_se <- sqrt(diag(X %*% vcov_beta %*% t(X)))  # Standard errors
+    # Store Predictions in Dataframe
+    newdat_start_flowers1 <- newdat_yr_effects_start_flowers %>%
+      mutate(
+        link_se = exp(link_se),
+        predicted = exp(link_predictions),  # Poisson uses log-link, so exp() transforms predictions back
+        lower = exp(link_predictions - 1.96 * link_se),  # Confidence interval lower bound
+        upper = exp(link_predictions + 1.96 * link_se),  # Confidence interval upper bound
+        Measure = "start",  # Label for Measure
+        Phase = "OpenFlowers"  # Label for Phase
+      )
+      # Verify Predictions Using predict()
+      newdat_start_flowers1 <- newdat_start_flowers1 %>%
+        mutate(
+          predict_check = predict(yr_effects_start_flowers, newdata = newdat_yr_effects_start_flowers, type = "response", re.form = NA)
+        )%>%
+        dplyr::select(ExpYrCat,Treatment_Combo,Measure,Phase,predicted, link_se) 
+        
+    # START OF FRUITS
+    # Generate Model Matrix for New Data
+    fixed_formula <- reformulate(attr(terms(yr_effects_start_fruits), "term.labels"))  # Extract fixed effects formula
+    X <- model.matrix(fixed_formula, newdat_yr_effects_start_fruits)  # Generate model matrix
+    # Extract Fixed Effect Estimates and Variance-Covariance Matrix
+    beta_hat <- fixef(yr_effects_start_fruits)  # Fixed effects
+    vcov_beta <- vcov(yr_effects_start_fruits)  # Covariance matrix
+    # Compute Predictions and Standard Errors
+    link_predictions <- X %*% beta_hat  # Predictions on link scale
+    link_se <- sqrt(diag(X %*% vcov_beta %*% t(X)))  # Standard errors
+    # Store Predictions in Dataframe
+    newdat_start_fruits1 <- newdat_yr_effects_start_fruits %>%
+      mutate(
+        link_se = exp(link_se),
+        predicted = exp(link_predictions),  # Poisson uses log-link, so exp() transforms predictions back
+        lower = exp(link_predictions - 1.96 * link_se),  # Confidence interval lower bound
+        upper = exp(link_predictions + 1.96 * link_se),  # Confidence interval upper bound
+        Measure = "start",  # Label for Measure
+        Phase = "RipeFruits"  # Label for Phase
+      )
+    # Verify Predictions Using predict()
+    newdat_start_fruits1 <- newdat_start_fruits1 %>%
+      mutate(
+        predict_check = predict(yr_effects_start_fruits, newdata = newdat_yr_effects_start_fruits, type = "response", re.form = NA)
+      )%>%
+        dplyr::select(ExpYrCat,Treatment_Combo,Measure,Phase,predicted, link_se) 
+      
+    # END OF LEAVES
+    # Extract the fixed-effects formula (no response variable, no random effects)
+        fixed_formula <- reformulate(attr(terms(yr_effects_end_leaves), "term.labels"))
+        # Generate the model matrix for the new data
+        X <- model.matrix(fixed_formula, newdat_yr_effects_end_leaves)
+        # Extract fixed-effect estimates and covariance matrix
+        beta_hat <- fixef(yr_effects_end_leaves)  # Fixed effects
+        vcov_beta <- vcov(yr_effects_end_leaves)  # Covariance matrix of fixed effects
+        # Calculate predictions on the link scale
+        link_predictions <- X %*% beta_hat
+        # Standard errors for the link scale predictions
+        link_se <- sqrt(diag(X %*% vcov_beta %*% t(X)))
+        # Generate predictions
+        end_leaves_predictions <- predict(yr_effects_end_leaves, newdata = newdat_yr_effects_end_leaves, type = "link", re.form = NA) 
+        # Back-transform predictions and confidence intervals
+        newdat_end_leaves1 <- newdat_yr_effects_end_leaves %>%
+          mutate(
+                link_se = (exp(link_se))^2,
+                predicted = 365 - (exp(link_predictions))^2 - 1,  # Back-transform predictions
+                # lower = (exp(link_predictions - 1.96 * link_se))^2,  # Lower bound
+                # upper = (exp(link_predictions + 1.96 * link_se))^2,  # Upper bound
+
+            # Back-transform predictions to the original response scale
+            # predicted = 365 - (link_predictions^2 - 1),
+            # Back-transform link_se to the response scale
+            #link_se <- exp(link_predictions) * link_se,
+    
+            Measure = "start",  # Label for Measure
+            Phase = "Leaves"  # Label for Phase
+          ) %>% 
+          mutate(Measure = rep("end"), Phase = rep("Leaves")) #%>% dplyr::select(-c(se_sqrt,predicted_sqrt,lower_sqrt,upper_sqrt))
+        # Verify Predictions Using predict()
+        newdat_end_leaves1 <- newdat_end_leaves1 %>%
+          mutate(
+            predict_check = predict(yr_effects_end_leaves, newdata = newdat_yr_effects_end_leaves, type = "response", re.form = NA)
+          )%>%
+        dplyr::select(ExpYrCat,Treatment_Combo,Measure,Phase,predicted, link_se) 
+        
+    # END OF FLOWERS
+    # Extract the fixed-effects formula (no response variable, no random effects)
+        fixed_formula <- reformulate(attr(terms(yr_effects_end_flowers), "term.labels"))
+        # Generate the model matrix for the new data
+        X <- model.matrix(fixed_formula, newdat_yr_effects_end_flowers)
+        # Extract fixed-effect estimates and covariance matrix
+        beta_hat <- fixef(yr_effects_end_flowers)  # Fixed effects
+        vcov_beta <- vcov(yr_effects_end_flowers)  # Covariance matrix of fixed effects
+        # Calculate predictions on the link scale
+        link_predictions <- X %*% beta_hat
+        # Standard errors for the link scale predictions
+        link_se <- sqrt(diag(X %*% vcov_beta %*% t(X)))
+        # Generate predictions
+        end_flowers_predictions <- predict(yr_effects_end_flowers, newdata = newdat_yr_effects_end_flowers, type = "link", re.form = NA) 
+        # Back-transform predictions and confidence intervals
+        newdat_end_flowers1 <- newdat_yr_effects_end_flowers %>%
+          mutate(
+                link_se = (exp(link_se))^2,
+                predicted = 365 - (exp(link_predictions))^2 - 1,  # Back-transform predictions
+                # lower = (exp(link_predictions - 1.96 * link_se))^2,  # Lower bound
+                # upper = (exp(link_predictions + 1.96 * link_se))^2,  # Upper bound
+
+            # Back-transform predictions to the original response scale
+            # predicted = 365 - (link_predictions^2 - 1),
+            # Back-transform link_se to the response scale
+            #link_se <- exp(link_predictions) * link_se,
+    
+            Measure = "start",  # Label for Measure
+            Phase = "Leaves"  # Label for Phase
+          ) %>% 
+          mutate(Measure = rep("end"), Phase = rep("OpenFlowers")) #%>% dplyr::select(-c(se_sqrt,predicted_sqrt,lower_sqrt,upper_sqrt))
+        # Verify Predictions Using predict()
+        newdat_end_flowers1 <- newdat_end_flowers1 %>%
+          mutate(
+            predict_check = predict(yr_effects_end_flowers, newdata = newdat_yr_effects_end_flowers, type = "response", re.form = NA)
+          )%>%
+        dplyr::select(ExpYrCat,Treatment_Combo,Measure,Phase,predicted, link_se) 
+        
+    # END OF FRUITS
+    # Extract the fixed-effects formula (no response variable, no random effects)
+        fixed_formula <- reformulate(attr(terms(yr_effects_end_fruits), "term.labels"))
+        # Generate the model matrix for the new data
+        X <- model.matrix(fixed_formula, newdat_yr_effects_end_fruits)
+        # Extract fixed-effect estimates and covariance matrix
+        beta_hat <- fixef(yr_effects_end_fruits)  # Fixed effects
+        vcov_beta <- vcov(yr_effects_end_fruits)  # Covariance matrix of fixed effects
+        # Calculate predictions on the link scale
+        link_predictions <- X %*% beta_hat
+        # Standard errors for the link scale predictions
+        link_se <- sqrt(diag(X %*% vcov_beta %*% t(X)))
+        # Generate predictions
+        end_fruits_predictions <- predict(yr_effects_end_fruits, newdata = newdat_yr_effects_end_fruits, type = "link", re.form = NA) 
+        # Back-transform predictions and confidence intervals
+        newdat_end_fruits1 <- newdat_yr_effects_end_fruits %>%
+          mutate(
+                link_se = (exp(link_se))^2,
+                predicted = 365 - (exp(link_predictions))^2 - 1,  # Back-transform predictions
+            Measure = "start",  # Label for Measure
+            Phase = "Leaves"  # Label for Phase
+          ) %>% 
+          mutate(Measure = rep("end"), Phase = rep("RipeFruits")) #%>% dplyr::select(-c(se_sqrt,predicted_sqrt,lower_sqrt,upper_sqrt))
+        # Verify Predictions Using predict()
+        newdat_end_fruits1 <- newdat_end_fruits1 %>%
+          mutate(
+            predict_check = predict(yr_effects_end_fruits, newdata = newdat_yr_effects_end_fruits, type = "response", re.form = NA)
+          )%>%
+        dplyr::select(ExpYrCat,Treatment_Combo,Measure,Phase,predicted, link_se) 
+        
+        # Combine dataframes
+        newdata_all_models <- bind_rows(newdat_start_leaves1, 
+                                        newdat_start_flowers1, 
+                                        newdat_start_fruits1, 
+                                        newdat_end_leaves1, 
+                                        newdat_end_flowers1, 
+                                        newdat_end_fruits1)
+        # Add anova significance codes
+        newdata_all_models <- newdata_all_models %>%
+          # specify that these are all instances where ExpYr interacts with treatment (technically)
+          mutate(Treatment_Combo = ifelse(Treatment_Combo == "Ctrl", "Ctrl : Year", Treatment_Combo)) %>%
+          #mutate(Treatment_Combo = paste(Treatment_Combo, ":ExpYrCat")) %>%
+          left_join(., aov_preds, by = c("Treatment_Combo", "Phase", "Measure")) 
+        
+# create treatment effects dataframe
+treatment_effects_all <- newdata_all_models %>%
+  group_by(ExpYrCat, Phase, Measure) %>%
+  # Separate Ctrl rows
+  mutate(is_ctrl = Treatment_Combo == "Ctrl : Year") %>%
+  # Create separate dataframes for Ctrl and non-Ctrl
+  group_split() %>%
+  map_df(function(df_group) {
+    ctrl_row <- df_group %>% filter(is_ctrl)
+    non_ctrl_rows <- df_group %>% filter(!is_ctrl)
+
+    # Join Ctrl values to each non-Ctrl row
+    non_ctrl_rows %>%
+      left_join(ctrl_row %>% 
+                  dplyr::select(predicted_ctrl = predicted, 
+                         link_se_ctrl = link_se,
+                         ExpYrCat, Phase, Measure),
+                by = c("ExpYrCat", "Phase", "Measure")) %>%
+      mutate(
+        predicted_diff = predicted - predicted_ctrl,
+        link_se_diff = sqrt(link_se^2 + link_se_ctrl^2)
+      )
+  }) %>%
+  dplyr::select(ExpYrCat, Phase, Measure, Treatment_Combo, predicted_diff, link_se_diff)
+        
+    
+# Step 4: Plots
+        treatment_effects_all$Measure <- factor(treatment_effects_all$Measure, levels = c("start", "end"))
+        newdata_all_models$Measure <- factor(newdata_all_models$Measure, levels = c("start", "end"))
+        # labels for plots
+        Phase.labs <- c("Leaves", "Open Flowers", "Ripe Fruits")
+        names(Phase.labs) <- c("Leaves", "OpenFlowers", "RipeFruits")
+         
+        Measure.labs <- c("Start", "End")
+        names(Measure.labs) <- c("start", "end")
+
+newdata_all_models$Treatment_Combo <- factor(newdata_all_models$Treatment_Combo, levels = c("Ctrl :ExpYrCat", "+T :ExpYrCat", "-W :ExpYrCat", "+C :ExpYrCat", "+N :ExpYrCat"))
+treatment_effects_all$Treatment_Combo <- factor(treatment_effects_all$Treatment_Combo, levels = c("+T", "-W", "+C", "+N"))
+
+# WITH treatment effects
+treatment_effects_all_2 <- treatment_effects_all %>%
+  mutate(ExpYrNum = as.numeric(ifelse(ExpYrCat == 1,"2012", 
+                           ifelse(ExpYrCat ==  2, "2013",
+                                  ifelse(ExpYrCat ==  3, "2014",
+                                         ifelse(ExpYrCat == 4, "2015", 
+                                                ifelse(ExpYrCat ==  5, "2016",
+                                                       ifelse(ExpYrCat == 6, "2017",
+                                                              ifelse(ExpYrCat == 7, "2018",
+                                                                     ifelse(ExpYrCat == 8,"2019",
+                                                                            ifelse(ExpYrCat ==  9, "2020",
+                                                                                   ifelse(ExpYrCat == 10, "2021",
+                                                                                          ifelse(ExpYrCat == 11, "2022",
+                                                                                                 ifelse(ExpYrCat == 12, 2023, NA)))))))))))))) #%>% 
+
+plot_data <- treatment_effects_all_2 %>%
+  left_join(cumulative_gdd_year, by = c("ExpYrNum" = "Year")) 
+
+plot_data %>%
+  mutate(PhaseMeasure = paste(Measure, Phase, sep = " of "),
+         PhaseMeasure = ifelse(PhaseMeasure == "end of Leaves", "End of Leaves",
+                               ifelse(PhaseMeasure == "start of Leaves", "Start of Leaves",
+                                      ifelse(PhaseMeasure == "end of OpenFlowers", "End of Flowers",
+                                             ifelse(PhaseMeasure == "start of OpenFlowers", "Start of Flowers",
+                                                    ifelse(PhaseMeasure == "start of RipeFruits", "Start of Fruits", 
+                                                           ifelse(PhaseMeasure == "end of RipeFruits", "End of Fruits", PhaseMeasure)))))),
+         PhaseMeasure = factor(PhaseMeasure, levels = c("Start of Leaves", "End of Leaves", "Start of Flowers", "End of Flowers", "Start of Fruits", "End of Fruits"))) %>%
+ggplot(. , aes(x = predicted_diff, y = as.factor(ExpYrNum), color = Treatment_Combo)) +
+  geom_point(position = position_dodge(0.5), size = 1.75) +
+  geom_vline(xintercept = 0, col = "black", linetype = "dashed") +
+  geom_errorbar(aes(xmin = predicted_diff - link_se_diff, xmax = predicted_diff + link_se_diff), position = position_dodge(0.5), width = 0) +
+  labs(
+   # title = "Model Predictions for Phase Start and End by Year",
+    x = "Treatment response (Mean Day of Year ± 1 SE)",
+    y = "Year of the experiment"
+  ) +
+  theme(
+    panel.border = element_rect(color = "black", fill = NA),
+    panel.background = element_rect(fill = "white"),
+    plot.background = element_rect(fill = "white"),
+    panel.grid.major = element_line(color = "grey90", size = 0.25),
+    panel.grid.minor = element_blank(), 
+    strip.background.x=element_rect(color = NA,  fill=NA), 
+    strip.background.y=element_rect(color = "black",  fill=NA),
+    strip.text = element_text(size = 10, face = "bold"),
+    plot.title = element_text(hjust = 0.5),
+    axis.text = element_text(size = 12),
+    axis.title = element_text(size = 12), #face = "bold"
+    legend.position = "left",
+    legend.background = element_rect(fill = "white"),
+    legend.title = element_text()
+  ) +
+  scale_color_manual(values = c("+T"="firebrick1",
+                                "-W"="cornflowerblue",
+                                "+C"="grey50",
+                                "+N"="palegreen3"), name = "Treatment") +
+  facet_wrap(. ~ PhaseMeasure, ncol = 2
+             )
+# interannual variability section
+```
+[Back to Index](#index)
+ 
+################################################################################
+# Select, run and graph models
+################################################################################
+# STEPS:
+# 1) run iterative models to extract least-complicated-order model based on p-values
+# 2) print out best-fit/final models for each response combination
+# 3) run predict() sequence for that model combination
+
+When to Use lmer() vs. glmer() models (Decision Guide)
+Criterion                   |	lmer()	                    | glmer()
+----------------------------|-----------------------------|---------------------------
+Response Variable Type      |	Continuous (e.g., time)	    | Count, binary, proportions
+Residual Distribution	      | Normal	                    | Non-normal, skewed
+Overdispersion Detected?    |	No	                        | Yes (variance > mean)
+Interpretability Needed?    |	Easier	                    | More complex but flexible
+
+Notes on distributions
+Distribution                    | Use Case	                      | glmer() Syntax
+--------------------------------|------------------------.--------|-----------------------------
+Poisson	                        | Count data, no overdispersion   | family = poisson
+Negative Binomial	              | Overdispersed count data        | glmer.nb()
+Gamma	                          | Continuous, right-skewed data   |	family = Gamma(link = "log")
+Zero-Inflated Poisson	          | Excess zeros in count data      | glmmTMB() (family = poisson)
+Zero-Inflated Negative Binomial	| Excess zeros + overdispersion   | glmmTMB() (family = nbinom2)
+
+ # *Some notes on model distribution and selection with AICc:*
+     # If AICc < 2 units difference → Choose the simpler model for both datasets.
+     # If AICc > 2 units difference → Stick with the model that fits each dataset better individually.
+     # Count Data Consistency: If both datasets are count-based, Poisson or Negative Binomial is preferred.
+     
+# Decision Hierarchy for My Data (Best Practices):
+    First: Check if overdispersion is present (I've done this already in an earlier chunk).
+    Then: If overdispersion is not severe, use a Poisson GLMM.
+    If overdispersion is present: use continuous (Non-negative) Gamma GLMM (glmer)
+    For Excess Zeros: Try Zero-Inflated Models as a last resort.
+  
+# If overdispersion is present (in the case of non-transformed variables), prioritize handling it (Negative Binomial or Gamma).
+# If both count data + overdispersion, Use a Square-Root transformation on the response varible
+
+###################### some notes on back-transformations ######################
+
+    Back-transforming is necessary when the response variable has been transformed (e.g., square-root, log, or Box-Cox transformation) to meet model assumptions. The goal is to return predicted values and confidence intervals to the original scale for meaningful interpretation.
+
+    *Why We Do It:*
+    - Interpretability: Model coefficients and predictions are in the transformed space, which can be misleading if not reversed.
+    - Comparability: Allows direct comparison with raw data or other studies using untransformed scales.
+    - Correct Error Propagation: Ensures confidence intervals and effect sizes reflect the original measurement scale.
+    *When We Do It:*
+    - After obtaining predictions (fitted values) from the model.
+    - Before visualizing or reporting results.
+    - When presenting effect sizes, estimated means, or confidence intervals.
+    
+    - Some of the models below use a Gamma (log-link) distribution, predicted values are exponentiated. Thus, we need to undo both transformations:
+
+  *Back-transformed value = (e^predicted)^2*
+
+#### Model Selection: selection for best-fit models, given interacting treatment effects {#model_selection}
+    Why GLMM over LMM?
+    + Count data is non-Gaussian and right-skewed, violating assumptions of LMM.
+    + Poisson/Negative Binomial GLMM can model the discrete nature of data more appropriately.
+    + GLMMs allow for non-normal distributions and address overdispersion more effectively.
+    
+    The following random effects were included in the model to account for hierarchical structure:
+    (1 | ExpYrCat) + (1 | Species.observed) + (1|Ring/Plot) + (1|ExpYrCat:Species.observed) + (1|Ring:Plot:Species.observed)
+    + Plot is nested within Ring.
+    + Species identity appears across multiple plots, not exclusively within plots.
+    + Including ExpYrCat accounts for temporal variations across years.
+    + Variance decomposition (VarCorr()) confirmed low variance for some random effects, suggesting possible overfitting.
+```{r}
+# ensure temp and water treatments are factors before we start
+    df2$Temp.Treatment <- as.factor(df2$Temp.Treatment)
+    df2$Water.Treatment <- as.factor(df2$Water.Treatment)
+    
+# Start with higher-order interactions. If overdispersion is detected, switch from poisson to gamma, compare using AICc
+    
+# If there is a significant main effect, keep adjascent two-way interactions in final model. 
+    
+##### Start of leaves ##########################################################
+            # 4-way (full-interactive model)
+            start_leaves_glmer_poisson_4 <- glmer(start ~ Temp.Treatment * Water.Treatment * CO2.Treatment * N.Treatment + (1 | ExpYrCat) + (1 | Species.observed) + (1|Ring:Plot:Species.observed), data = subset(df2, Phase == "Leaves"), family = poisson)
+            check_overdispersion(start_leaves_glmer_poisson_4) # good
+            car::vif(start_leaves_glmer_poisson_4) # not good ( should be 4 or less)
+            anova(start_leaves_glmer_poisson_4) 
+            Anova(start_leaves_glmer_poisson_4)
+            # no 3 or 4-way interactions, so moving down to 2 
+            
+            start_leaves_glmer_poisson_2 <- glmer(start ~ Temp.Treatment + Water.Treatment + CO2.Treatment + N.Treatment + Temp.Treatment:Water.Treatment + Temp.Treatment:CO2.Treatment + Temp.Treatment:N.Treatment + Water.Treatment:CO2.Treatment + Water.Treatment:N.Treatment + CO2.Treatment:N.Treatment + (1 | ExpYrCat) + (1 | Species.observed) + (1|Ring:Plot:Species.observed), data = subset(df2, Phase == "Leaves"), family = poisson)
+            check_overdispersion(start_leaves_glmer_poisson_2)
+            car::vif(start_leaves_glmer_poisson_2) # better
+            anova(start_leaves_glmer_poisson_2)
+            Anova(start_leaves_glmer_poisson_2)
+        # Significant: Temp.Treatment, Temp.Treatment:N.Treatment
+
+        # glmer for predict():
+        # keep Temp.Treatment-adjacent interactions
+        start_leaves_preds <- glmer(start ~ Temp.Treatment + Water.Treatment + N.Treatment + CO2.Treatment + Temp.Treatment:Water.Treatment + Temp.Treatment:N.Treatment + Temp.Treatment:CO2.Treatment + Water.Treatment:N.Treatment + Water.Treatment:CO2.Treatment + N.Treatment:CO2.Treatment + (1 | ExpYrCat) + (1 | Species.observed) + (1|Ring:Plot:Species.observed), data = subset(df2, Phase == "Leaves"), family = poisson)
+
+
+##### Start of flowers #########################################################
+            # start with higher-order interactions
+            # 4-way (full-interactive model)
+            start_flowers_glmer_poisson_4 <- glmer(start ~ Temp.Treatment * Water.Treatment * CO2.Treatment * N.Treatment + (1 | ExpYrCat) + (1 | Species.observed) + (1|Ring:Plot:Species.observed), data = subset(df2, Phase == "OpenFlowers"), family = poisson)
+            check_overdispersion(start_flowers_glmer_poisson_4) 
+            car::vif(start_flowers_glmer_poisson_4) # not good
+            anova(start_flowers_glmer_poisson_4) 
+            Anova(start_flowers_glmer_poisson_4)
+            # no 3 or 4-way interactions, so moving down to 2
+            
+            start_flowers_glmer_poisson_2 <- glmer(start ~ Temp.Treatment + Water.Treatment + CO2.Treatment + N.Treatment + Temp.Treatment:Water.Treatment + Temp.Treatment:CO2.Treatment + Temp.Treatment:N.Treatment + Water.Treatment:CO2.Treatment + Water.Treatment:N.Treatment + CO2.Treatment:N.Treatment + (1 | ExpYrCat) + (1 | Species.observed) + (1|Ring:Plot:Species.observed), data = subset(df2, Phase == "OpenFlowers"), family = poisson)
+            check_overdispersion(start_flowers_glmer_poisson_2)
+            car::vif(start_flowers_glmer_poisson_2) 
+            anova(start_flowers_glmer_poisson_2)
+            Anova(start_flowers_glmer_poisson_2)
+        # Significant: Temp.Treatment 
+            
+        # glmer for predict():
+        # keep Temp.Treatment-adjacent interactions
+        start_flowers_preds <- glmer(start ~ Temp.Treatment + Water.Treatment + N.Treatment + CO2.Treatment + Temp.Treatment:Water.Treatment + Temp.Treatment:N.Treatment + Temp.Treatment:CO2.Treatment + Water.Treatment:N.Treatment + Water.Treatment:CO2.Treatment + N.Treatment:CO2.Treatment + (1 | ExpYrCat) + (1 | Species.observed) + (1|Ring:Plot:Species.observed), data = subset(df2, Phase == "OpenFlowers"), family = poisson)
+        # OR:
+        start_flowers_preds <- glmer(start ~ Temp.Treatment + Water.Treatment + N.Treatment + CO2.Treatment + (1 | ExpYrCat) + (1 | Species.observed) + (1|Ring:Plot:Species.observed), data = subset(df2, Phase == "OpenFlowers"), family = poisson)
+            
+    
+##### Start of fruits ##########################################################
+            # start with higher-order interactions
+            # 4-way (full-interactive model)
+            start_fruits_glmer_poisson_4 <- glmer(start ~ Temp.Treatment * Water.Treatment * CO2.Treatment * N.Treatment + (1 | ExpYrCat) + (1 | Species.observed) + (1|Ring:Plot:Species.observed), data = subset(df2, Phase == "RipeFruits"), family = poisson)
+            check_overdispersion(start_fruits_glmer_poisson_4)
+            car::vif(start_fruits_glmer_poisson_4) # not good
+            anova(start_fruits_glmer_poisson_4) 
+            Anova(start_fruits_glmer_poisson_4)
+            # no 3 or 4-way interactions, so moving down to 2
+            
+            start_fruits_glmer_poisson_2 <- glmer(start ~ Temp.Treatment + Water.Treatment + CO2.Treatment + N.Treatment + Temp.Treatment:Water.Treatment + Temp.Treatment:CO2.Treatment + Temp.Treatment:N.Treatment + Water.Treatment:CO2.Treatment + Water.Treatment:N.Treatment + CO2.Treatment:N.Treatment + (1 | ExpYrCat) + (1 | Species.observed) + (1|Ring:Plot:Species.observed), data = subset(df2, Phase == "RipeFruits"), family = poisson)
+            check_overdispersion(start_fruits_glmer_poisson_2)
+            car::vif(start_fruits_glmer_poisson_2)
+            anova(start_fruits_glmer_poisson_2)
+            Anova(start_fruits_glmer_poisson_2)
+        # Significant: Temp.Treatment, Water.Treatment
+            
+        # glmer for predict():
+        # keep Water-Treatment- and Temp.Treatment-adjacent interactions
+        start_fruits_preds <- glmer(start ~ Temp.Treatment + Water.Treatment + Temp.Treatment:Water.Treatment + Temp.Treatment:CO2.Treatment + Temp.Treatment:N.Treatment + Water.Treatment:CO2.Treatment + Water.Treatment:N.Treatment + (1 | ExpYrCat) + (1 | Species.observed) + (1|Ring:Plot:Species.observed), data = subset(df2, Phase == "RipeFruits"), family = poisson)
+
+##### End of leaves ############################################################
+            end_leaves_glmer_poisson_4 <- glmer(end_rev ~ Temp.Treatment * Water.Treatment * CO2.Treatment * N.Treatment + (1 | ExpYrCat) + (1 | Species.observed) + (1|Ring:Plot:Species.observed), data = subset(df2, Phase == "Leaves"), family = poisson)
+            check_overdispersion(end_leaves_glmer_poisson_4) 
+            # overdispersion detected, so transform end variable & use gamma log-link 
+            end_leaves_glmer_gamma_2 <- glmer(sqrt_end_rev ~ Temp.Treatment + Water.Treatment + CO2.Treatment + N.Treatment + Temp.Treatment:Water.Treatment + Temp.Treatment:CO2.Treatment + Temp.Treatment:N.Treatment + Water.Treatment:CO2.Treatment + Water.Treatment:N.Treatment + CO2.Treatment:N.Treatment + (1 | ExpYrCat) + (1 | Species.observed) + (1|Ring:Plot:Species.observed), data = subset(df2, Phase == "Leaves"), family = Gamma(link = "log"))
+            # we can't test for overdispersion b/c overdispersion checks can only be used for models from Poisson families or binomial families with trials > 1.
+            car::vif(end_leaves_glmer_gamma_2)
+            anova(end_leaves_glmer_gamma_2)
+            Anova(end_leaves_glmer_gamma_2)
+            
+            # retroactively check if higher-order interactions are important
+            # 4-way (full-interactive model)
+            end_leaves_glmer_gamma_4 <- glmer(sqrt_end_rev ~ Temp.Treatment * Water.Treatment * CO2.Treatment * N.Treatment + (1 | ExpYrCat) + (1 | Species.observed) + (1|Ring:Plot:Species.observed), data = subset(df2, Phase == "Leaves"), family = Gamma(link = "log")) 
+
+            car::vif(end_leaves_glmer_gamma_4) # nope
+            anova(end_leaves_glmer_gamma_4) 
+            Anova(end_leaves_glmer_gamma_4)
+            # no 3 or 4-way interactions, so 2-way models (above) was the right choice
+            # Significant: Temp.Treatment:CO2.Treatment
+            
+        # glmer for predict():
+        # No main effects here (which is so interesting!), so no need to add any adjacent interactions
+        end_leaves_preds <- glmer(sqrt_end_rev ~  Temp.Treatment + Water.Treatment + CO2.Treatment + N.Treatment + Temp.Treatment:Water.Treatment + Temp.Treatment:CO2.Treatment + Temp.Treatment:N.Treatment + Water.Treatment:CO2.Treatment + Water.Treatment:N.Treatment + CO2.Treatment:N.Treatment + (1 | ExpYrCat) + (1 | Species.observed) + (1|Ring:Plot:Species.observed), data = subset(df2, Phase == "Leaves"), family = Gamma(link = "log")) 
+        # took out: Temp.Treatment + CO2.Treatment + Temp.Treatment:CO2.Treatment
+        # ^^ 2023 update :'(
+
+##### End of flowers ###########################################################
+            end_flowers_glmer_poisson_2 <- glmer(end_rev ~ Temp.Treatment + Water.Treatment + CO2.Treatment + N.Treatment + Temp.Treatment:Water.Treatment + Temp.Treatment:CO2.Treatment + Temp.Treatment:N.Treatment + Water.Treatment:CO2.Treatment + Water.Treatment:N.Treatment + CO2.Treatment:N.Treatment + (1 | ExpYrCat) + (1 | Species.observed) + (1|Ring:Plot:Species.observed), data = subset(df2, Phase == "OpenFlowers"), family = poisson)
+            check_overdispersion(end_flowers_glmer_poisson_2) 
+            # overdispersion detected, so transform end variable
+            end_flowers_glmer_gamma_2 <- glmer(sqrt_end_rev ~ Temp.Treatment + Water.Treatment + CO2.Treatment + N.Treatment + Temp.Treatment:Water.Treatment + Temp.Treatment:CO2.Treatment + Temp.Treatment:N.Treatment + Water.Treatment:CO2.Treatment + Water.Treatment:N.Treatment + CO2.Treatment:N.Treatment + (1 | ExpYrCat) + (1 | Species.observed) + (1|Ring:Plot:Species.observed), data = subset(df2, Phase == "OpenFlowers"), family = Gamma(link = "log"))
+            car::vif(end_flowers_glmer_gamma_2)
+            anova(end_flowers_glmer_gamma_2)
+            Anova(end_flowers_glmer_gamma_2)
+            
+            # retroactively check if higher-order interactions are important
+            # 4-way (full-interactive model)
+            end_flowers_glmer_gamma_4 <- glmer(sqrt_end_rev ~ Temp.Treatment * Water.Treatment * CO2.Treatment * N.Treatment + (1 | ExpYrCat) + (1 | Species.observed) + (1|Ring:Plot:Species.observed), data = subset(df2, Phase == "OpenFlowers"), family = Gamma(link = "log"))
+            # (still) can't check for overdispersion 
+            car::vif(end_flowers_glmer_gamma_4) # nope
+            anova(end_flowers_glmer_gamma_4) 
+            Anova(end_flowers_glmer_gamma_4)
+            # no 3 or 4-way interactions, so 2-way models (above) was the right choice!
+            
+        # Significant: Water.Treatment 
+        # nothing significant...put all main effects in model instead
+        # glmer for predict():
+        # No main effects here (which is so interesting!), so no need to add any adjacent interactions
+       end_flowers_preds <- glmer(sqrt_end_rev ~ Temp.Treatment + Water.Treatment + CO2.Treatment + N.Treatment + (1 | ExpYrCat) + (1 | Species.observed) + (1|Ring:Plot:Species.observed), data = subset(df2, Phase == "OpenFlowers"), family = Gamma(link = "log"))
+        
+##### End of fruits ############################################################
+            end_fruits_glmer_poisson_2 <- glmer(end_rev ~ Temp.Treatment + Water.Treatment + CO2.Treatment + N.Treatment + Temp.Treatment:Water.Treatment + Temp.Treatment:CO2.Treatment + Temp.Treatment:N.Treatment + Water.Treatment:CO2.Treatment + Water.Treatment:N.Treatment + CO2.Treatment:N.Treatment + (1 | ExpYrCat) + (1 | Species.observed) + (1|Ring:Plot:Species.observed), data = subset(df2, Phase == "RipeFruits"), family = poisson)
+            check_overdispersion(end_fruits_glmer_poisson_2)
+            # overdispersion detected, so transform end variable
+            end_fruits_glmer_gamma_2 <- glmer(sqrt_end_rev ~ Temp.Treatment + Water.Treatment + CO2.Treatment + N.Treatment + Temp.Treatment:Water.Treatment + Temp.Treatment:CO2.Treatment + Temp.Treatment:N.Treatment + Water.Treatment:CO2.Treatment + Water.Treatment:N.Treatment + CO2.Treatment:N.Treatment + (1 | ExpYrCat) + (1 | Species.observed) + (1|Ring:Plot:Species.observed), data = subset(df2, Phase == "RipeFruits"), family = Gamma(link = "log")) 
+            car::vif(end_fruits_glmer_gamma_2)
+            anova(end_fruits_glmer_gamma_2)
+            Anova(end_fruits_glmer_gamma_2)
+            
+            # retroactively check if higher-order interactions are important
+            # 4-way (full-interactive model)
+            end_fruits_glmer_gamma_4 <- glmer(sqrt_end_rev ~ Temp.Treatment * Water.Treatment * CO2.Treatment * N.Treatment + (1 | ExpYrCat) + (1 | Species.observed) + (1|Ring:Plot:Species.observed), data = subset(df2, Phase == "RipeFruits"), family = Gamma(link = "log"))
+            # (still) can't check for overdispersion (haha)
+            car::vif(end_fruits_glmer_gamma_4) # not good
+            anova(end_fruits_glmer_gamma_4) 
+            Anova(end_fruits_glmer_gamma_4) # Temp.Treatment:CO2.Treatment:N.Treatment is M.S., but not by much
+            # no 3 or 4-way interactions, so 2-way models (above) was the right choice
+            
+        # Significant: Temp.Treatment:CO2.Treatment
+        # glmer for predict():
+       end_fruits_preds <- glmer(sqrt_end_rev ~ Temp.Treatment + Water.Treatment + CO2.Treatment + N.Treatment + (1 | ExpYrCat) + (1 | Species.observed) + (1|ExpYrCat:Ring:Species.observed), data = subset(df2, Phase == "RipeFruits"),  family = Gamma(link = "log")) 
+```
+[Back to Index](#index)
+
+#### graph residuals, address model complexity and overfitting {#model_checks}
+```{r}
+    par(mfrow = c(2,3))
+    plot(start_leaves_glmer_poisson_2, main = "Residuals: Start/Leaves, Poisson")
+    plot(start_flowers_glmer_poisson_2, main = "Residuals: Start/Flowers, Poisson")
+    plot(start_fruits_glmer_poisson_2, main = "Residuals: Start/Fruits, Poisson")
+    
+    plot(end_leaves_glmer_gamma_2, main = "Residuals: End/Leaves, Gamma")
+    plot(end_flowers_glmer_gamma_2, main = "Residuals: End/Flowers, Gamma")
+    plot(end_fruits_glmer_gamma_2, main = "Residuals: End/Fruits, Gamma")
+    par(mfrow = c(1,1))
+
+# Run AICc for to get approximate DF for each instance
+AICc(start_leaves_glmer_poisson_2,
+     start_flowers_glmer_poisson_2,
+     start_fruits_glmer_poisson_2,
+     
+     end_leaves_glmer_gamma_2,
+     end_flowers_glmer_gamma_2,
+     end_fruits_glmer_gamma_2)
+# These df are a little low, but in the ballpark ranges for these variables...
+
+# Multicollinearity Check (VIF):
+vif(start_leaves_glmer_poisson_2) # it is similar for other models...
+vif(start_flowers_glmer_poisson_2)
+vif(start_fruits_glmer_poisson_2)
+
+vif(end_leaves_glmer_gamma_2)
+vif(end_flowers_glmer_gamma_2)
+vif(end_fruits_glmer_gamma_2)
+# No multicollinearity detected (all VIF < 5)
+
+# Cross-Validation Results:
+train_control <- trainControl(method = "cv", number = 5)
+cv_model <- train(start ~ Temp.Treatment + Water.Treatment + CO2.Treatment + 
+                    N.Treatment, data = subset(df2, Phase == "Leaves"), 
+                    method = "glm", family = poisson, trControl = train_control)
+print(cv_model)
+# Result: No substantial model instability detected across folds.
+
+# end residuals, compexity, overfitting
+```
+[Back to Index](#index)
+
+This workflow (above) rigorously confirms that the GLMM approach with Poisson and Gamma distributions is the most suitable for analyzing our phenological data. This methodology properly handles count data, non-normal distributions, and overdispersion while balancing complexity and model fit.
+
+    A note about getting DF from glmers: this is basically impossible (there is no method for it)
+        + GLMMs use maximum likelihood estimation (MLE), which doesn't directly compute degrees of freedom for fixed effects.
+        + The asymptotic approximation assumes infinite degrees of freedom for large datasets, which explains the Inf values in our AICc output.
+        + Denominator degrees of freedom in mixed models are complex due to the partial pooling of information from random effects.
+        + From Ben Bolker: Run the model in lme (if possible) and use the denominator df reported there (which follow a simple ‘inner-outer’ rule which should correspond to the canonical answer for simple/orthogonal designs), applied to t or F tests
+
+#### graph model means and SEs using predict() {#main_graphs}
+```{r}
+# Step 1: get NumDF and DenDF for all models
+    # re-run using nlme to approximate df
+    start_leaves_preds_lme <- lme(
+      fixed = start ~ Temp.Treatment + Water.Treatment + N.Treatment + CO2.Treatment +
+               Temp.Treatment:Water.Treatment + Temp.Treatment:N.Treatment + Temp.Treatment:CO2.Treatment +
+               Water.Treatment:N.Treatment + Water.Treatment:CO2.Treatment +
+               N.Treatment:CO2.Treatment,
+      random = list(ExpYrCat = ~1, Species.observed = ~1, Ring = ~1 | Plot),
+      data = subset(df2, Phase == "Leaves")
+    );anova(start_leaves_preds_lme)
+    
+    start_flowers_preds_lme <- lme(
+      fixed = start ~ Temp.Treatment,
+      random = list(ExpYrCat = ~1, Species.observed = ~1, Ring = ~1 | Plot),
+      data = subset(df2, Phase == "OpenFlowers")
+    );anova(start_flowers_preds_lme)
+    
+    start_fruits_preds_lme <- lme(
+      fixed = start ~ Temp.Treatment + Water.Treatment + Temp.Treatment:Water.Treatment,
+      random = list(ExpYrCat = ~1, Species.observed = ~1, Ring = ~1 | Plot),
+      data = subset(df2, Phase == "RipeFruits")
+    );anova(start_fruits_preds_lme)
+    
+    end_leaves_preds_lme <- lme(
+      fixed = sqrt_end_rev ~ Temp.Treatment + Water.Treatment + N.Treatment + CO2.Treatment +
+               Temp.Treatment:Water.Treatment + Temp.Treatment:N.Treatment + Temp.Treatment:CO2.Treatment +
+               Water.Treatment:N.Treatment + Water.Treatment:CO2.Treatment +
+               N.Treatment:CO2.Treatment,
+      random = list(ExpYrCat = ~1, Species.observed = ~1, Ring = ~1 | Plot),
+      data = subset(df2, Phase == "Leaves")
+    );anova(end_leaves_preds_lme)
+    
+    end_flowers_preds_lme <- lme(
+      fixed = sqrt_end_rev ~ Temp.Treatment + Water.Treatment + N.Treatment + CO2.Treatment,
+      random = list(ExpYrCat = ~1, Species.observed = ~1, Ring = ~1 | Plot),
+      data = subset(df2, Phase == "OpenFlowers")
+    );anova(end_flowers_preds_lme)
+    
+    end_fruits_preds_lme <- lme(
+      fixed = sqrt_end_rev ~ Temp.Treatment + Water.Treatment + N.Treatment + CO2.Treatment,
+      random = list(ExpYrCat = ~1, Species.observed = ~1, Ring = ~1 | Plot),
+      data = subset(df2, Phase == "RipeFruits")
+    );anova(end_fruits_preds_lme)
+    
+
+# Step 2: List the Models & Variables that are Significant in Each Model
+    anova(start_leaves_preds) # Significant: Temp.Treatment, Temp.Treatment:N.Treatment (added N.Treatment by itself too...)
+    anova(start_flowers_preds) # Significant: Temp.Treatment 
+    anova(start_fruits_preds) # Significant: Temp.Treatment, Water.Treatment
+  
+    anova(end_leaves_preds) # Significant: Temp.Treatment:CO2.Treatment & CO2.Treatment:N.Treatment (added Temp.Treatment, N.Treatment and CO2.Treatment by themselves too...)
+    anova(end_flowers_preds) # Significant: Water.Treatment 
+    anova(end_fruits_preds) # Significant: none, but each variable is included separately for kicks
+    
+    # Make ANOVA table out of predicts output
+    start_leaves_preds_aov <- data.frame(Anova(start_leaves_preds)[3]); start_leaves_preds_aov <- start_leaves_preds_aov %>% mutate(Measure = rep("start"), Phase = rep("Leaves"))
+    start_flowers_preds_aov <- data.frame(Anova(start_flowers_preds)[3]); start_flowers_preds_aov <- start_flowers_preds_aov %>% mutate(Measure = rep("start"), Phase = rep("OpenFlowers"))
+    start_fruits_preds_aov <- data.frame(Anova(start_fruits_preds)[3]); start_fruits_preds_aov <- start_fruits_preds_aov %>% mutate(Measure = rep("start"), Phase = rep("RipeFruits"))
+    
+    end_leaves_preds_aov <- data.frame(Anova(end_leaves_preds)[3]); end_leaves_preds_aov <- end_leaves_preds_aov %>% mutate(Measure = rep("end"), Phase = rep("Leaves"))
+    end_flowers_preds_aov <- data.frame(Anova(end_flowers_preds)[3]); end_flowers_preds_aov <- end_flowers_preds_aov %>% mutate(Measure = rep("end"), Phase = rep("OpenFlowers"))
+    end_fruits_preds_aov <- data.frame(Anova(end_fruits_preds)[3]); end_fruits_preds_aov <- end_fruits_preds_aov %>% mutate(Measure = rep("end"), Phase = rep("RipeFruits"))
+    
+    # bind
+    aov_preds <- bind_rows(start_leaves_preds_aov,
+                           start_flowers_preds_aov,
+                           start_fruits_preds_aov,
+                           end_leaves_preds_aov,
+                           end_flowers_preds_aov,
+                           end_fruits_preds_aov)
+    # add significance codes
+    aov_preds <- aov_preds %>% mutate(Significance = ifelse(Pr..Chisq. < 0.001, "***",
+                                                            ifelse(Pr..Chisq. < 0.01, "**", 
+                                                                   ifelse(Pr..Chisq. < 0.05, "*", 
+                                                                          ifelse(Pr..Chisq. < 0.1, ".", ""))))) %>%
+      # create row names for join to preds dataframe (below)
+      rownames_to_column(var = "rowname") %>%
+      mutate(Treatment_Combo = case_when(
+        grepl("Temp", rowname) ~ "Warming",
+        grepl("Water", rowname) ~ "-W",
+        grepl("N", rowname) ~ "+N",
+        grepl("CO2", rowname) ~ "+C",
+        TRUE ~ ""
+      )) %>%
+      mutate(Treatment_Combo = paste0(
+        ifelse(grepl("Temp", rowname), "+T", ""),
+        ifelse(grepl("Water", rowname), "-W", ""),
+        ifelse(grepl("N", rowname), "+N", ""),
+        ifelse(grepl("CO2", rowname), "+C", "")
+      )) %>%
+      column_to_rownames(var = "rowname") %>%
+      mutate(Treatment_Combo = ifelse(Treatment_Combo == "+N+C", "+C+N", Treatment_Combo))
+      
+    # check out DFs via AICs
+    AICc(start_leaves_preds,
+         start_flowers_preds,
+         start_fruits_preds,
+         end_leaves_preds,
+         end_flowers_preds,
+         end_fruits_preds)
+    # Unlike linear mixed models (lmer), generalized linear mixed models (glmer) do not directly compute denominator degrees of freedom (DF). This is because glmer uses maximum likelihood (ML) or restricted maximum likelihood (REML) estimation, which does not inherently assign DF to fixed effects.
+
+    # However, there are several methods for estimating denominator DF that are commonly used:
+    # Extract DF for fixed effects
+    emm <- emmeans(start_leaves_preds, ~ Temp.Treatment)
+    emm
+    # "df = Inf" means that glmer is using Wald tests, which assume infinite DF.
+    
+# Step 3: Generate a New Datasets for Predictions
+    # Create a new datasets for predictions
+    newdat <- expand.grid(
+          Temp.Treatment = c("HTamb", "HTelv"),
+          Water.Treatment = c("H2Oamb", "H2Oneg"),
+          CO2.Treatment = c("ambient CO2", "+CO2"),
+          N.Treatment = c("ambient N", "+N")
+        ) %>% # now we can tailor this dataset 
+        mutate(
+        # add treatment combo column
+        Treatment_Combo = case_when(
+          Temp.Treatment == "HTelv" & Water.Treatment == "H2Oamb" & CO2.Treatment == "ambient CO2" & N.Treatment == "ambient N" ~ "+T",
+          Temp.Treatment == "HTamb" & Water.Treatment == "H2Oneg" & CO2.Treatment == "ambient CO2" & N.Treatment == "ambient N" ~ "-W",
+          Temp.Treatment == "HTamb" & Water.Treatment == "H2Oamb" & CO2.Treatment == "+CO2" & N.Treatment == "ambient N" ~ "+C",
+          Temp.Treatment == "HTamb" & Water.Treatment == "H2Oamb" & CO2.Treatment == "ambient CO2" & N.Treatment == "+N" ~ "+N",
+          Temp.Treatment == "HTamb" & Water.Treatment == "H2Oamb" & CO2.Treatment == "ambient CO2" & N.Treatment == "ambient N" ~ "Ctrl", # All ambient
+          TRUE ~ paste0(
+            ifelse(Temp.Treatment == "HTelv", "+T", ""),
+            ifelse(Water.Treatment == "H2Oneg", "-W", ""),
+            ifelse(CO2.Treatment == "+CO2", "+C", ""),
+            ifelse(N.Treatment == "+N", "+N", "")
+          )
+        )
+      ) %>%
+      # remove instances of 3 & 4-way interactions
+      mutate(
+        non_ambient_count = rowSums(data.frame(
+          Temp.Treatment != "HTamb",
+          Water.Treatment != "H2Oamb",
+          CO2.Treatment != "ambient CO2",
+          N.Treatment != "ambient N"
+        ))
+      ) %>%
+      filter(non_ambient_count <= 2) %>% # Keep only rows with <= 2 non-ambient variables
+      dplyr::select(-non_ambient_count) # Drop the helper column
+    
+# Step 4: Generate specific datasets for models
+    # START OF LEAVES
+    # Significant: Temp.Treatment, Temp.Treatment:N.Treatment (added N.Treatment by itself too...)
+    newdat_start_leaves <- newdat %>%
+      # filter to get specific instances we're testing with this response
+      filter(Treatment_Combo %in% c("Ctrl", "+T", "+N", "+T+N"))
+    
+    # START OF FLOWERS
+    # Significant: Temp.Treatment 
+    newdat_start_flowers <- newdat %>%
+      # filter to get specific instances we're testing with this response
+      filter(Treatment_Combo %in% c("Ctrl", "+T"))
+    
+    # START OF FRUITS
+    # Significant: Temp.Treatment, Water.Treatment
+    newdat_start_fruits <- newdat %>%
+      # filter to get specific instances we're testing with this response
+      filter(Treatment_Combo %in% c("Ctrl", "+T", "-W"))
+    
+    # END OF LEAVES
+    # Significant: Temp.Treatment:CO2.Treatment (added Temp.Treatment and CO2.Treatment by themselves too...)
+    newdat_end_leaves <- newdat %>%
+      # filter to get specific instances we're testing with this response
+      filter(Treatment_Combo %in% c("Ctrl", "+T", "+C", "+N", "+C+N", "+T+C"))
+    # END OF FLOWERS
+    # Significant: Water.Treatment 
+    newdat_end_flowers <- newdat %>%
+      # filter to get specific instances we're testing with this response
+      filter(Treatment_Combo %in% c("Ctrl", "+T", "-W", "+C", "+N"))
+    
+    # END OF FRUITS
+    # Significant: none, but each variable is included separately for kicks
+    newdat_end_fruits <- newdat %>%
+      # filter to get specific instances we're testing with this response
+      filter(Treatment_Combo %in% c("Ctrl", "+T", "-W", "+C", "+N"))  
+
+# Step 5: Extract predictors and standard errors (RUN IN SEQUENCE!)
+    # START OF LEAVES
+    # Generate Model Matrix for New Data
+    fixed_formula <- reformulate(attr(terms(start_leaves_preds), "term.labels"))  # Extract fixed effects formula
+    X <- model.matrix(fixed_formula, newdat_start_leaves)  # Generate model matrix
+    # Extract Fixed Effect Estimates and Variance-Covariance Matrix
+    beta_hat <- fixef(start_leaves_preds)  # Fixed effects
+    vcov_beta <- vcov(start_leaves_preds)  # Covariance matrix
+    # Compute Predictions and Standard Errors
+    link_predictions <- X %*% beta_hat  # Predictions on link scale
+    link_se <- sqrt(diag(X %*% vcov_beta %*% t(X)))  # Standard errors
+    # Store Predictions in Dataframe
+    newdat_start_leaves1 <- newdat_start_leaves %>%
+      mutate(
+        link_se = exp(link_se),
+        predicted = exp(link_predictions),  # Poisson uses log-link, so exp() transforms predictions back
+        lower = exp(link_predictions - 1.96 * link_se),  # Confidence interval lower bound
+        upper = exp(link_predictions + 1.96 * link_se),  # Confidence interval upper bound
+        Measure = "start",  # Label for Measure
+        Phase = "Leaves"  # Label for Phase
+      )
+      # Verify Predictions Using predict()
+      newdat_start_leaves1 <- newdat_start_leaves1 %>%
+        mutate(
+          predict_check = predict(start_leaves_preds, newdata = newdat_start_leaves, type = "response", re.form = NA)
+        )
+        
+    # START OF FLOWERS
+    # Generate Model Matrix for New Data
+    fixed_formula <- reformulate(attr(terms(start_flowers_preds), "term.labels"))  # Extract fixed effects formula
+    X <- model.matrix(fixed_formula, newdat_start_flowers)  # Generate model matrix
+    # Extract Fixed Effect Estimates and Variance-Covariance Matrix
+    beta_hat <- fixef(start_flowers_preds)  # Fixed effects
+    vcov_beta <- vcov(start_flowers_preds)  # Covariance matrix
+    # Compute Predictions and Standard Errors
+    link_predictions <- X %*% beta_hat  # Predictions on link scale
+    link_se <- sqrt(diag(X %*% vcov_beta %*% t(X)))  # Standard errors
+    # Store Predictions in Dataframe
+    newdat_start_flowers1 <- newdat_start_flowers %>%
+      mutate(
+        link_se = exp(link_se),
+        predicted = exp(link_predictions),  # Poisson uses log-link, so exp() transforms predictions back
+        lower = exp(link_predictions - 1.96 * link_se),  # Confidence interval lower bound
+        upper = exp(link_predictions + 1.96 * link_se),  # Confidence interval upper bound
+        Measure = "start",  # Label for Measure
+        Phase = "OpenFlowers"  # Label for Phase
+      )
+      # Verify Predictions Using predict()
+      newdat_start_flowers1 <- newdat_start_flowers1 %>%
+        mutate(
+          predict_check = predict(start_flowers_preds, newdata = newdat_start_flowers, type = "response", re.form = NA)
+        )
+        
+    # START OF FRUITS
+    # Generate Model Matrix for New Data
+    fixed_formula <- reformulate(attr(terms(start_fruits_preds), "term.labels"))  # Extract fixed effects formula
+    X <- model.matrix(fixed_formula, newdat_start_fruits)  # Generate model matrix
+    # Extract Fixed Effect Estimates and Variance-Covariance Matrix
+    beta_hat <- fixef(start_fruits_preds)  # Fixed effects
+    vcov_beta <- vcov(start_fruits_preds)  # Covariance matrix
+    # Compute Predictions and Standard Errors
+    link_predictions <- X %*% beta_hat  # Predictions on link scale
+    link_se <- sqrt(diag(X %*% vcov_beta %*% t(X)))  # Standard errors
+    # Store Predictions in Dataframe
+    newdat_start_fruits1 <- newdat_start_fruits %>%
+      mutate(
+        link_se = exp(link_se),
+        predicted = exp(link_predictions),  # Poisson uses log-link, so exp() transforms predictions back
+        lower = exp(link_predictions - 1.96 * link_se),  # Confidence interval lower bound
+        upper = exp(link_predictions + 1.96 * link_se),  # Confidence interval upper bound
+        Measure = "start",  # Label for Measure
+        Phase = "RipeFruits"  # Label for Phase
+      )
+    # Verify Predictions Using predict()
+    newdat_start_fruits1 <- newdat_start_fruits1 %>%
+      mutate(
+        predict_check = predict(start_fruits_preds, newdata = newdat_start_fruits, type = "response", re.form = NA)
+      )
+      
+    # END OF LEAVES
+    # Extract the fixed-effects formula (no response variable, no random effects)
+        fixed_formula <- reformulate(attr(terms(end_leaves_preds), "term.labels"))
+        # Generate the model matrix for the new data
+        X <- model.matrix(fixed_formula, newdat_end_leaves)
+        # Extract fixed-effect estimates and covariance matrix
+        beta_hat <- fixef(end_leaves_preds)  # Fixed effects
+        vcov_beta <- vcov(end_leaves_preds)  # Covariance matrix of fixed effects
+        # Calculate predictions on the link scale
+        link_predictions <- X %*% beta_hat
+        # Standard errors for the link scale predictions
+        link_se <- sqrt(diag(X %*% vcov_beta %*% t(X)))
+        # Generate predictions
+        end_leaves_predictions <- predict(end_leaves_preds, newdata = newdat_end_leaves, type = "link", re.form = NA) 
+        # Back-transform predictions and confidence intervals
+        newdat_end_leaves1 <- newdat_end_leaves %>%
+          mutate(
+                link_se = (exp(link_se))^2,
+                predicted = 365 - (exp(link_predictions))^2 - 1,  # Back-transform predictions
+            Measure = "start",  # Label for Measure
+            Phase = "Leaves"  # Label for Phase
+          ) %>% 
+          mutate(Measure = rep("end"), Phase = rep("Leaves")) #%>% dplyr::select(-c(se_sqrt,predicted_sqrt,lower_sqrt,upper_sqrt))
+        # Verify Predictions Using predict()
+        newdat_end_leaves1 <- newdat_end_leaves1 %>%
+          mutate(
+            predict_check = predict(end_leaves_preds, newdata = newdat_end_leaves, type = "response", re.form = NA)
+          )
+        
+    # END OF FLOWERS
+    # Extract the fixed-effects formula (no response variable, no random effects)
+        fixed_formula <- reformulate(attr(terms(end_flowers_preds), "term.labels"))
+        # Generate the model matrix for the new data
+        X <- model.matrix(fixed_formula, newdat_end_flowers)
+        # Extract fixed-effect estimates and covariance matrix
+        beta_hat <- fixef(end_flowers_preds)  # Fixed effects
+        vcov_beta <- vcov(end_flowers_preds)  # Covariance matrix of fixed effects
+        # Calculate predictions on the link scale
+        link_predictions <- X %*% beta_hat
+        # Standard errors for the link scale predictions
+        link_se <- sqrt(diag(X %*% vcov_beta %*% t(X)))
+        # Generate predictions
+        end_flowers_predictions <- predict(end_flowers_preds, newdata = newdat_end_flowers, type = "link", re.form = NA) 
+        # Back-transform predictions and confidence intervals
+        newdat_end_flowers1 <- newdat_end_flowers %>%
+          mutate(
+                link_se = (exp(link_se))^2,
+                predicted = 365 - (exp(link_predictions))^2 - 1,  # Back-transform predictions
+            Measure = "start",  # Label for Measure
+            Phase = "Leaves"  # Label for Phase
+          ) %>% 
+          mutate(Measure = rep("end"), Phase = rep("OpenFlowers")) 
+        # Verify Predictions Using predict()
+        newdat_end_flowers1 <- newdat_end_flowers1 %>%
+          mutate(
+            predict_check = predict(end_flowers_preds, newdata = newdat_end_flowers, type = "response", re.form = NA)
+          )
+        
+    # END OF FRUITS
+    # Extract the fixed-effects formula (no response variable, no random effects)
+        fixed_formula <- reformulate(attr(terms(end_fruits_preds), "term.labels"))
+        # Generate the model matrix for the new data
+        X <- model.matrix(fixed_formula, newdat_end_fruits)
+        # Extract fixed-effect estimates and covariance matrix
+        beta_hat <- fixef(end_fruits_preds)  # Fixed effects
+        vcov_beta <- vcov(end_fruits_preds)  # Covariance matrix of fixed effects
+        # Calculate predictions on the link scale
+        link_predictions <- X %*% beta_hat
+        # Standard errors for the link scale predictions
+        link_se <- sqrt(diag(X %*% vcov_beta %*% t(X)))
+        # Generate predictions
+        end_fruits_predictions <- predict(end_fruits_preds, newdata = newdat_end_fruits, type = "link", re.form = NA) 
+        # Back-transform predictions and confidence intervals
+        newdat_end_fruits1 <- newdat_end_fruits %>%
+          mutate(
+                link_se = (exp(link_se))^2,
+                predicted = 365 - (exp(link_predictions))^2 - 1,  # Back-transform predictions
+            Measure = "start",  # Label for Measure
+            Phase = "Leaves"  # Label for Phase
+          ) %>% 
+          mutate(Measure = rep("end"), Phase = rep("RipeFruits")) #%>% dplyr::select(-c(se_sqrt,predicted_sqrt,lower_sqrt,upper_sqrt))
+        # Verify Predictions Using predict()
+        newdat_end_fruits1 <- newdat_end_fruits1 %>%
+          mutate(
+            predict_check = predict(end_fruits_preds, newdata = newdat_end_fruits, type = "response", re.form = NA)
+          )
+        
+        # Combine dataframes
+        newdata_all_models <- bind_rows(newdat_start_leaves1, 
+                                        newdat_start_flowers1, 
+                                        newdat_start_fruits1, 
+                                        newdat_end_leaves1, 
+                                        newdat_end_flowers1, 
+                                        newdat_end_fruits1)
+        # Add anova significance codes
+        newdata_all_models <- newdata_all_models %>%
+          left_join(., aov_preds, by = c("Treatment_Combo", "Phase", "Measure"))
+        
+    
+# Step 6: Plots
+        newdata_all_models$Measure <- factor(newdata_all_models$Measure, levels = c("start", "end"))
+        # labels for plots
+        Phase.labs <- c("Leaves", "Open Flowers", "Ripe Fruits")
+        names(Phase.labs) <- c("Leaves", "OpenFlowers", "RipeFruits")
+         
+        Measure.labs <- c("Start", "End")
+        names(Measure.labs) <- c("start", "end")
+
+newdata_all_models$Treatment_Combo <- factor(newdata_all_models$Treatment_Combo, levels = c("Ctrl", "+T", "+N", "-W", "+C", "+T+N", "+T+C","+C+N"))
+
+# PLOT WITH ALL MODELS
+ggplot(newdata_all_models, aes(y = Treatment_Combo, x = predicted, color = Treatment_Combo)) +
+  geom_point(position = position_dodge(0.5), size = 3) +
+  geom_errorbar(aes(xmin = predicted - link_se, xmax = predicted + link_se), position = position_dodge(0.5), width = 0.2) +
+  labs(
+    title = "Model Predictions for Phase Start and End",
+    x = "Mean Day of Year ± 1 SE",
+    y = "Treatment"
+  ) +
+  geom_shadowtext(aes(label = Significance),
+                  position = position_dodge(width = 0.6),
+                  hjust = -0.25, vjust = -0.25, size = 4,
+                  color = "black", bg.color = "white", bg.r = 0.1, # Add white outline
+                  show.legend = FALSE) + 
+  theme(
+    panel.border = element_rect(color = "black", fill = NA),
+    panel.background = element_rect(fill = "white"),
+    plot.background = element_rect(fill = "white"),
+    panel.grid.major = element_line(color = "grey90", size = 0.25),
+    panel.grid.minor = element_blank(),
+    strip.background.x=element_rect(color = NA,  fill=NA), 
+    strip.background.y=element_rect(color = "black",  fill=NA),
+    strip.text = element_text(size = 10, face = "bold"),
+    plot.title = element_text(hjust = 0.5),
+    axis.title = element_text(size = 12), #face = "bold"
+    legend.position = "right",
+    legend.background = element_rect(fill = "white"),
+    legend.title = element_text()
+  ) +
+  scale_color_manual(values = c("black", 
+                                "firebrick1", 
+                                "palegreen3",
+                                "cornflowerblue", 
+                                "grey50", 
+                                "gold3",
+                                "chocolate4",
+                                "darkgreen"), name = "Treatment") +
+  facet_wrap(Phase ~ Measure, scales = "free_x", ncol = 2,
+             labeller = labeller(Phase = Phase.labs, Measure = Measure.labs))
+
+# INDIVIDUAL PLOTS FOR EACH MODEL
+trt_palette <- c("Ctrl"="black", 
+                "+T"="firebrick1", 
+                "+N"="palegreen3",
+                "-W"="cornflowerblue", 
+                "+C"="grey50", 
+                "+T+N"="gold3",
+                "+T+C"="chocolate4",
+                "+C+N"="darkgreen")
+custom_theme <- theme(
+  panel.border = element_rect(color = "black", fill = NA),
+  panel.background = element_rect(fill = "white"),
+  plot.background = element_rect(fill = "white"),
+  panel.grid.major = element_line(color = "grey90", size = 0.25),
+  panel.grid.minor = element_blank(),
+  strip.background.x = element_rect(color = NA, fill = NA), 
+  strip.background.y = element_rect(color = "black", fill = NA),
+  strip.text = element_text(size = 10, face = "bold"),
+  plot.title = element_text(face = "bold"),
+  axis.title = element_text(size = 10), 
+  legend.position = "right",
+  legend.background = element_rect(fill = "white"),
+  legend.title = element_text()
+)
+
+# Start of Leaves
+newdata_all_models %>%
+  filter(Measure == "start" & Phase == "Leaves") %>%
+ggplot(., aes(y = Treatment_Combo, x = predicted, color = Treatment_Combo, linetype = Treatment_Combo)) +
+  geom_point(position = position_dodge(0.5), size = 4) +
+  geom_errorbar(aes(xmin = predicted - link_se, xmax = predicted + link_se), position = position_dodge(0.5), width = 0.1, size = 1) +
+  labs(
+    x = expression(bold("Start of Leaves") ~ "- Mean Day of Year ± 1 SE"),
+    y = expression(bold("Treatment"))
+  ) +
+  custom_theme +
+  scale_color_manual(values = trt_palette, name = " ", labels = c("Control", "Warming", "+Nitrogen", "Warming x +Nitrogen")) +
+  scale_linetype_manual(
+    values = c("Ctrl" = "solid", "+T" = "solid", "+N" = "dashed", "-W" = "dashed", "+T+N" = "solid"),
+    name = " ", guide = "none"
+    ) +
+  guides(color = guide_legend(reverse = TRUE)) +
+  scale_y_discrete(labels = c("Control", "Warming", "+Nitrogen", "Warming x +Nitrogen"))
+
+# Start of flowers
+newdata_all_models %>%
+  filter(Measure == "start" & Phase == "OpenFlowers") %>%
+ggplot(., aes(y = Treatment_Combo, x = predicted, color = Treatment_Combo, linetype = Treatment_Combo)) +
+  geom_point(position = position_dodge(0.5), size = 4) +
+  geom_errorbar(aes(xmin = predicted - link_se, xmax = predicted + link_se), position = position_dodge(0.5), width = 0.1, size = 1) +
+  labs(
+    x = expression(bold("Start of Open Flowers") ~ "- Mean Day of Year ± 1 SE"),
+    y = expression(bold("Treatment"))
+  ) +
+  custom_theme +
+  scale_color_manual(values = trt_palette, name = " ", labels = c("Control", "Warming")) +
+  scale_linetype_manual(
+    values = c("Ctrl" = "solid", "+T" = "solid"),
+    name = " ",
+    labels = c("Control", "Warming"),
+  guide = "none") +
+  guides(color = guide_legend(reverse = TRUE)) +
+  scale_y_discrete(labels = c("Control", "Warming"))
+
+# Start of fruits
+newdata_all_models %>%
+  filter(Measure == "start" & Phase == "RipeFruits") %>%
+ggplot(., aes(y = Treatment_Combo, x = predicted, color = Treatment_Combo, linetype = Treatment_Combo)) +
+  geom_point(position = position_dodge(0.5), size = 4) +
+  geom_errorbar(aes(xmin = predicted - link_se, xmax = predicted + link_se), position = position_dodge(0.5), width = 0.1, size = 1) +
+  labs(
+    x = expression(bold("Start of Ripe Fruits") ~ "- Mean Day of Year ± 1 SE"),
+    y = expression(bold("Treatment"))
+  ) +
+  custom_theme +
+  scale_color_manual(values = trt_palette, name = " ", labels = c("Control", "Warming", "-Rainfall")) +
+  scale_linetype_manual(
+    values = c("Ctrl" = "solid", "+T" = "solid", "-W" = "solid"),
+    name = " ",
+  guide = "none") +
+  guides(color = guide_legend(reverse = TRUE)) +
+  scale_y_discrete(labels = c("Control", "Warming", "-Rainfall"))
+
+# End of Leaves
+newdata_all_models %>%
+  filter(Measure == "end" & Phase == "Leaves") %>%
+ggplot(., aes(y = Treatment_Combo, x = predicted, color = Treatment_Combo, linetype = Treatment_Combo)) +
+  geom_point(position = position_dodge(0.5), size = 4) +
+  geom_errorbar(aes(xmin = predicted - link_se, xmax = predicted + link_se), position = position_dodge(0.5), width = 0.1, size = 1) +
+  labs(
+    x = expression(bold("End of Leaf Senescence") ~ "- Mean Day of Year ± 1 SE"),
+    y = expression(bold("Treatment"))
+  ) +
+  custom_theme +
+  scale_color_manual(values = trt_palette, name = " ", labels = c("Control", "Warming", "+Nitrogen", bquote("+CO"[2]), bquote("Warming x +CO"[2]), bquote("+Nitrogen x +CO"[2]))) +
+  scale_linetype_manual(
+    values = c("Ctrl" = "solid", "+T" = "solid", "+N" = "dashed", "+C" = "dashed", "+T+C" = "solid", "+C+N" = "solid"),
+    name = " ",
+  guide = "none") +
+  guides(color = guide_legend(reverse = TRUE)) +
+  scale_y_discrete(labels = c("Control", "Warming", "+Nitrogen", bquote("+CO"[2]), bquote("Warming x +CO"[2]), bquote("+Nitrogen x +CO"[2])))
+
+# End of flowers
+ggplot(newdata_all_models %>%
+         filter(Measure == "end" & Phase == "OpenFlowers"),
+       aes(y = Treatment_Combo, x = predicted, color = Treatment_Combo, linetype = Treatment_Combo)) +
+  geom_point(position = position_dodge(0.5), size = 4) +
+  geom_errorbar(aes(xmin = predicted - link_se, xmax = predicted + link_se),
+                position = position_dodge(0.5), width = 0.1, size = 1) +
+  labs(
+    x = expression(bold("End of Open Flowers") ~ "- Mean Day of Year ± 1 SE"),
+    y = expression(bold("Treatment"))
+  ) +
+  custom_theme +
+  scale_color_manual(
+    values = trt_palette,
+    name = " ",
+    labels = c("Control", "Warming", "+Nitrogen", "-Rainfall", bquote("+CO"[2]))
+  ) +
+  scale_linetype_manual(
+    values = c("Ctrl" = "solid", "+T" = "dashed", "+N" = "dashed", "-W" = "dashed", "+C" = "dashed"),
+    name = " ",
+    labels = c("Control", "Warming", "Nitrogen", "-Rainfall", bquote("+CO"[2])),
+    guide = "none"
+  ) +
+  guides(color = guide_legend(reverse = TRUE)) +
+  scale_y_discrete(labels = c("Control", "Warming", "+Nitrogen", "-Rainfall", bquote("+CO"[2])))
+
+# End of fruits
+newdata_all_models %>%
+  filter(Measure == "end" & Phase == "RipeFruits") %>%
+ggplot(., aes(y = Treatment_Combo, x = predicted, color = Treatment_Combo, linetype = Treatment_Combo)) +
+  geom_point(position = position_dodge(0.5), size = 4) +
+  geom_errorbar(aes(xmin = predicted - link_se, xmax = predicted + link_se), position = position_dodge(0.5), width = 0.1, size = 1) +
+  labs(
+    x = expression(bold("End of Ripe Fruits") ~ "- Mean Day of Year ± 1 SE"),
+    y = expression(bold("Treatment"))
+  ) +
+  custom_theme +
+  scale_color_manual(values = trt_palette, name = " ", labels = c("Control", "Warming", "+Nitrogen", "-Rainfall", bquote("+CO"[2]))) +
+  scale_linetype_manual(
+    values = c("Ctrl" = "solid", "+T" = "dashed", "+N" = "dashed", "-W" = "dashed", "+C" = "dashed"),
+    name = " ",
+    labels = c("Control", "Warming", "+Nitrogen", "-Rainfall", bquote("+CO"[2])),
+   guide = "none") +
+  guides(color = guide_legend(reverse = TRUE)) +
+  scale_y_discrete(labels = c("Control", "Warming", "+Nitrogen", "-Rainfall", bquote("+CO"[2])))
+
+```
+[Back to Index](#index)
+
+#### graph model coefficients, but include ALL non-sig. interactions {#all_trt_graphs}
+```{r}
+# Step 1: List the Models & Variables that are Significant in Each Model
+    anova(start_leaves_glmer_poisson_4) 
+    anova(start_flowers_glmer_poisson_4)
+    anova(start_fruits_glmer_poisson_4) 
+  
+    anova(end_leaves_glmer_gamma_4)
+    anova(end_flowers_glmer_gamma_4) 
+    anova(end_fruits_glmer_gamma_4) 
+    
+    # check out DFs via AICs
+    AICc(start_leaves_glmer_poisson_4,
+         start_flowers_glmer_poisson_4,
+         start_fruits_glmer_poisson_4,
+         end_leaves_glmer_gamma_4,
+         end_flowers_glmer_gamma_4,
+         end_fruits_glmer_gamma_4)
+
+# Step 2: Generate a New Datasets for Predictions
+    # Create a new datasets for predictions
+    newdat <- expand.grid(
+          Temp.Treatment = c("HTamb", "HTelv"),
+          Water.Treatment = c("H2Oamb", "H2Oneg"),
+          CO2.Treatment = c("ambient CO2", "+CO2"),
+          N.Treatment = c("ambient N", "+N")
+        ) %>%  
+        mutate(
+        # add treatment combo column
+        Treatment_Combo = case_when(
+          Temp.Treatment == "HTelv" & Water.Treatment == "H2Oamb" & CO2.Treatment == "ambient CO2" & N.Treatment == "ambient N" ~ "+T",
+          Temp.Treatment == "HTamb" & Water.Treatment == "H2Oneg" & CO2.Treatment == "ambient CO2" & N.Treatment == "ambient N" ~ "-W",
+          Temp.Treatment == "HTamb" & Water.Treatment == "H2Oamb" & CO2.Treatment == "+CO2" & N.Treatment == "ambient N" ~ "+C",
+          Temp.Treatment == "HTamb" & Water.Treatment == "H2Oamb" & CO2.Treatment == "ambient CO2" & N.Treatment == "+N" ~ "+N",
+          Temp.Treatment == "HTamb" & Water.Treatment == "H2Oamb" & CO2.Treatment == "ambient CO2" & N.Treatment == "ambient N" ~ "Ctrl", # All ambient
+          TRUE ~ paste0(
+            ifelse(Temp.Treatment == "HTelv", "+T", ""),
+            ifelse(Water.Treatment == "H2Oneg", "-W", ""),
+            ifelse(CO2.Treatment == "+CO2", "+C", ""),
+            ifelse(N.Treatment == "+N", "+N", "")
+          )
+        )
+      ) 
+    
+# Step 3: Extract predictors and standard errors (RUN IN SEQUENCE!)
+    # START OF LEAVES
+    # Generate Model Matrix for New Data
+    fixed_formula <- reformulate(attr(terms(start_leaves_glmer_poisson_4), "term.labels"))  # Extract fixed effects formula
+    X <- model.matrix(fixed_formula, newdat)  # Generate model matrix
+    # Extract Fixed Effect Estimates and Variance-Covariance Matrix
+    beta_hat <- fixef(start_leaves_glmer_poisson_4)  # Fixed effects
+    vcov_beta <- vcov(start_leaves_glmer_poisson_4)  # Covariance matrix
+    # Compute Predictions and Standard Errors
+    link_predictions <- X %*% beta_hat  # Predictions on link scale
+    link_se <- sqrt(diag(X %*% vcov_beta %*% t(X)))  # Standard errors
+    # Store Predictions in Dataframe
+    newdat_start_leaves1 <- newdat %>%
+      mutate(
+        link_se = exp(link_se),
+        predicted = exp(link_predictions),  # Poisson uses log-link, so exp() transforms predictions back
+        lower = exp(link_predictions - 1.96 * link_se),  # Confidence interval lower bound
+        upper = exp(link_predictions + 1.96 * link_se),  # Confidence interval upper bound
+        Measure = "start",  # Label for Measure
+        Phase = "Leaves"  # Label for Phase
+      )
+      # Verify Predictions Using predict()
+      newdat_start_leaves1 <- newdat_start_leaves1 %>%
+        mutate(
+          predict_check = predict(start_leaves_glmer_poisson_4, newdata = newdat, type = "response", re.form = NA)
+        )
+        
+    # START OF FLOWERS
+    # Generate Model Matrix for New Data
+    fixed_formula <- reformulate(attr(terms(start_flowers_glmer_poisson_4), "term.labels"))  # Extract fixed effects formula
+    X <- model.matrix(fixed_formula, newdat)  # Generate model matrix
+    # Extract Fixed Effect Estimates and Variance-Covariance Matrix
+    beta_hat <- fixef(start_flowers_glmer_poisson_4)  # Fixed effects
+    vcov_beta <- vcov(start_flowers_glmer_poisson_4)  # Covariance matrix
+    # Compute Predictions and Standard Errors
+    link_predictions <- X %*% beta_hat  # Predictions on link scale
+    link_se <- sqrt(diag(X %*% vcov_beta %*% t(X)))  # Standard errors
+    # Store Predictions in Dataframe
+    newdat_start_flowers1 <- newdat %>%
+      mutate(
+        link_se = exp(link_se),
+        predicted = exp(link_predictions),  # Poisson uses log-link, so exp() transforms predictions back
+        lower = exp(link_predictions - 1.96 * link_se),  # Confidence interval lower bound
+        upper = exp(link_predictions + 1.96 * link_se),  # Confidence interval upper bound
+        Measure = "start",  # Label for Measure
+        Phase = "OpenFlowers"  # Label for Phase
+      )
+      # Verify Predictions Using predict()
+      newdat_start_flowers1 <- newdat_start_flowers1 %>%
+        mutate(
+          predict_check = predict(start_flowers_glmer_poisson_4, newdata = newdat, type = "response", re.form = NA)
+        )
+        
+    # START OF FRUITS
+    # Generate Model Matrix for New Data
+    fixed_formula <- reformulate(attr(terms(start_fruits_glmer_poisson_4), "term.labels"))  # Extract fixed effects formula
+    X <- model.matrix(fixed_formula, newdat)  # Generate model matrix
+    # Extract Fixed Effect Estimates and Variance-Covariance Matrix
+    beta_hat <- fixef(start_fruits_glmer_poisson_4)  # Fixed effects
+    vcov_beta <- vcov(start_fruits_glmer_poisson_4)  # Covariance matrix
+    # Compute Predictions and Standard Errors
+    link_predictions <- X %*% beta_hat  # Predictions on link scale
+    link_se <- sqrt(diag(X %*% vcov_beta %*% t(X)))  # Standard errors
+    # Store Predictions in Dataframe
+    newdat_start_fruits1 <- newdat %>%
+      mutate(
+        link_se = exp(link_se),
+        predicted = exp(link_predictions),  # Poisson uses log-link, so exp() transforms predictions back
+        lower = exp(link_predictions - 1.96 * link_se),  # Confidence interval lower bound
+        upper = exp(link_predictions + 1.96 * link_se),  # Confidence interval upper bound
+        Measure = "start",  # Label for Measure
+        Phase = "RipeFruits"  # Label for Phase
+      )
+    # Verify Predictions Using predict()
+    newdat_start_fruits1 <- newdat_start_fruits1 %>%
+      mutate(
+        predict_check = predict(start_fruits_glmer_poisson_4, newdata = newdat, type = "response", re.form = NA)
+      )
+      
+    # END OF LEAVES
+    # Extract the fixed-effects formula (no response variable, no random effects)
+        fixed_formula <- reformulate(attr(terms(end_leaves_glmer_gamma_4), "term.labels"))
+        # Generate the model matrix for the new data
+        X <- model.matrix(fixed_formula, newdat)
+        # Extract fixed-effect estimates and covariance matrix
+        beta_hat <- fixef(end_leaves_glmer_gamma_4)  # Fixed effects
+        vcov_beta <- vcov(end_leaves_glmer_gamma_4)  # Covariance matrix of fixed effects
+        # Calculate predictions on the link scale
+        link_predictions <- X %*% beta_hat
+        # Standard errors for the link scale predictions
+        link_se <- sqrt(diag(X %*% vcov_beta %*% t(X)))
+        # Generate predictions
+        end_leaves_predictions <- predict(end_leaves_glmer_gamma_4, newdata = newdat, type = "link", re.form = NA) 
+        # Back-transform predictions and confidence intervals
+        newdat_end_leaves1 <- newdat %>%
+          mutate(
+            link_se = (exp(link_se))^2,
+            predicted = 365 - (exp(link_predictions))^2 - 1
+          ) %>% mutate(Measure = rep("end_rev"), Phase = rep("Leaves"))
+        # Verify Predictions Using predict()
+        newdat_end_leaves1 <- newdat_end_leaves1 %>%
+          mutate(
+            predict_check = predict(end_leaves_glmer_gamma_4, newdata = newdat, type = "response", re.form = NA)
+          )
+        
+    # END OF FLOWERS
+    # Extract the fixed-effects formula (no response variable, no random effects)
+        fixed_formula <- reformulate(attr(terms(end_flowers_glmer_gamma_4), "term.labels"))
+        # Generate the model matrix for the new data
+        X <- model.matrix(fixed_formula, newdat)
+        # Extract fixed-effect estimates and covariance matrix
+        beta_hat <- fixef(end_flowers_glmer_gamma_4)  # Fixed effects
+        vcov_beta <- vcov(end_flowers_glmer_gamma_4)  # Covariance matrix of fixed effects
+        # Calculate predictions on the link scale
+        link_predictions <- X %*% beta_hat
+        # Standard errors for the link scale predictions
+        link_se <- sqrt(diag(X %*% vcov_beta %*% t(X)))
+        # Generate predictions
+        end_flowers_predictions <- predict(end_flowers_glmer_gamma_4, newdata = newdat, type = "link", re.form = NA) 
+        # Back-transform predictions and confidence intervals
+        newdat_end_flowers1 <- newdat %>%
+          mutate(
+            link_se = (exp(link_se))^2,
+            predicted = 365 - (exp(link_predictions))^2 - 1
+            # link_se = (exp(link_se))^2,
+            # predicted = (exp(link_predictions))^2,  # Back-transform predictions
+            # lower = (exp(link_predictions - 1.96 * link_se))^2,  # Lower bound
+            # upper = (exp(link_predictions + 1.96 * link_se))^2   # Upper bound
+          ) %>% mutate(Measure = rep("end_rev"), Phase = rep("OpenFlowers"))
+        # Verify Predictions Using predict()
+        newdat_end_flowers1 <- newdat_end_flowers1 %>%
+          mutate(
+            predict_check = predict(end_flowers_glmer_gamma_4, newdata = newdat, type = "response", re.form = NA)
+          )
+        
+    # END OF FRUITS
+    # Extract the fixed-effects formula (no response variable, no random effects)
+        fixed_formula <- reformulate(attr(terms(end_fruits_glmer_gamma_4), "term.labels"))
+        # Generate the model matrix for the new data
+        X <- model.matrix(fixed_formula, newdat)
+        # Extract fixed-effect estimates and covariance matrix
+        beta_hat <- fixef(end_fruits_glmer_gamma_4)  # Fixed effects
+        vcov_beta <- vcov(end_fruits_glmer_gamma_4)  # Covariance matrix of fixed effects
+        # Calculate predictions on the link scale
+        link_predictions <- X %*% beta_hat
+        # Standard errors for the link scale predictions
+        link_se <- sqrt(diag(X %*% vcov_beta %*% t(X)))
+        # Generate predictions
+        end_fruits_predictions <- predict(end_fruits_glmer_gamma_4, newdata = newdat, type = "link", re.form = NA) 
+        # Back-transform predictions and confidence intervals
+        newdat_end_fruits1 <- newdat %>%
+          mutate(
+            link_se = (exp(link_se))^2,
+            predicted = 365 - (exp(link_predictions))^2 - 1
+            # link_se = (exp(link_se))^2,
+            # predicted = (exp(link_predictions))^2,  # Back-transform predictions
+            # lower = (exp(link_predictions - 1.96 * link_se))^2,  # Lower bound
+            # upper = (exp(link_predictions + 1.96 * link_se))^2   # Upper bound
+          ) %>% mutate(Measure = rep("end_rev"), Phase = rep("RipeFruits"))
+        # Verify Predictions Using predict()
+        newdat_end_fruits1 <- newdat_end_fruits1 %>%
+          mutate(
+            predict_check = predict(end_fruits_glmer_gamma_4, newdata = newdat, type = "response", re.form = NA)
+          )
+        
+        # Combine dataframes
+        newdata_all_models <- bind_rows(newdat_start_leaves1, 
+                                        newdat_start_flowers1, 
+                                        newdat_start_fruits1, 
+                                        newdat_end_leaves1, 
+                                        newdat_end_flowers1, 
+                                        newdat_end_fruits1)
+        
+# Step 4: Plots
+        newdata_all_models$Measure <- factor(newdata_all_models$Measure, levels = c("start", "end_rev"))
+        # labels for plots
+        Phase.labs <- c("Leaves", "Open Flowers", "Ripe Fruits")
+        names(Phase.labs) <- c("Leaves", "OpenFlowers", "RipeFruits")
+         
+        Measure.labs <- c("Start", "End")
+        names(Measure.labs) <- c("start", "end_rev")
+        
+        # Define custom labels for the interactions
+        N_CO2_labels <- c("ambient N.ambient CO2" = "Ctrl", 
+                          "ambient N.+CO2" = "+C", 
+                          "+N.ambient CO2" = "+N", 
+                          "+N.+CO2" = "+C+N")
+        
+        Water_Temp_labels <- c("HTamb.H2Oamb" = "Ctrl", 
+                               "HTelv.H2Oamb" = "+T", 
+                               "HTamb.H2Oneg" = "-W", 
+                               "HTelv.H2Oneg" = "+T-W")
+        
+        # Create new columns by combining the relevant columns
+        newdata_all_models$N_CO2_Combined <- with(newdata_all_models, interaction(N.Treatment, CO2.Treatment, sep = "."))
+        newdata_all_models$Water_Temp_Combined <- with(newdata_all_models, interaction(Temp.Treatment, Water.Treatment, sep = "."))
+        
+        # Replace the values in the new columns with the custom labels
+        newdata_all_models$N_CO2_Combined <- N_CO2_labels[as.character(newdata_all_models$N_CO2_Combined)]
+        newdata_all_models$Water_Temp_Combined <- Water_Temp_labels[as.character(newdata_all_models$Water_Temp_Combined)]
+        
+        # Reorder the levels of the new variables
+        newdata_all_models$N_CO2_Combined <- factor(newdata_all_models$N_CO2_Combined, levels = c("Ctrl", "+C", "+N", "+C+N"))
+        newdata_all_models$Water_Temp_Combined <- factor(newdata_all_models$Water_Temp_Combined, levels = c("Ctrl", "+T", "-W", "+T-W"))
+        
+        # Find the value of 'predicted' where 'N_CO2_Combined' == 'Ctrl' & 'Water_Temp_Combined' == 'Ctrl' for each group of Phase and Measure
+        ctrl_predicted_values <- newdata_all_models[newdata_all_models$N_CO2_Combined == "Ctrl" & newdata_all_models$Water_Temp_Combined == "Ctrl", ]
+        ctrl_predicted_values <- aggregate(predicted ~ Phase + Measure, data = ctrl_predicted_values, FUN = mean)
+        
+        # Merge the ctrl_predicted_values back to the main dataframe
+        newdata_all_models <- merge(newdata_all_models, ctrl_predicted_values, by = c("Phase", "Measure"), suffixes = c("", "_ctrl"))
+        
+        # Plot with new columns and dashed vertical lines
+        ggplot(newdata_all_models, aes(y = N_CO2_Combined, x = predicted, color = Water_Temp_Combined)) +
+          geom_point(position = position_dodge(0.5), size = 3) +
+          geom_errorbar(aes(xmin = predicted - link_se, xmax = predicted + link_se), position = position_dodge(0.5), width = 0.2) +
+          geom_vline(aes(xintercept = V1), linetype = "dashed", color = "grey50") +
+          labs(
+            title = "Model Predictions for Phase Start and End",
+            subtitle = "Dashed line indicates true control",
+            x = "Mean DOY ± SE",
+            y = "Treatment"
+          ) +
+          theme(
+              panel.border = element_rect(color = "black", fill = NA),
+              panel.background = element_rect(fill = "white"),
+              plot.background = element_rect(fill = "white"),
+              panel.grid.major = element_line(color = "grey90", size = 0.25),
+              panel.grid.minor = element_blank(),
+              strip.background.x=element_rect(color = NA,  fill=NA), 
+              strip.background.y=element_rect(color = "black",  fill=NA),
+              strip.text = element_text(size = 10, face = "bold"),
+              plot.title = element_text(hjust = 0.5),
+              plot.subtitle = element_text(hjust = 0.5),
+              axis.title = element_text(size = 12), #face = "bold"
+              axis.text.y = element_text(face = "bold", size = 10),
+              legend.position = "right",
+              legend.background = element_rect(fill = "white"),
+              legend.title = element_text()
+            ) +
+          scale_x_continuous(labels = scales::number_format(accuracy = 1)) + #scheme
+          scale_color_manual(values = c("black", "firebrick1", "cornflowerblue", "maroon4"), name = "Treatment", labels = c("Ambient", "+T", "-W", "+T-W")) +
+          facet_wrap(Phase ~ Measure, scales = "free_x", ncol = 2,
+           labeller = labeller(Phase = Phase.labs, Measure = Measure.labs)) 
+```
+[Back to Index](#index)
+
+#### calculate heat treatments effect on growing degree days {#gdd}
+    
+    # look at comparison of years in study to average of 1963 - 2011 period (previous 48 years)
+```{r}
+# just show the raw data over time. We don't necessarily make assumptions that the treatments worked
+
+head(weather)
+
+# Assuming your dataset is already loaded as 'weather'
+# Convert the DATE column to Date format
+weather <- weather %>%
+  mutate(Date = as.Date(Date, format = "%m/%d/%Y"))
+
+# Exclude the year 2020 from the dataset (no data collected during COVID yr 1)
+weather_filtered <- weather %>%
+  filter(year(Date) != 2020) %>%
+  filter(year(Date) > 2011 & year(Date) < 2024) %>%
+  # change temp to degrees C and precip to mm
+  dplyr::mutate(MaxTemp.degC. = (MaxTemp.degF.- 32)*5/9,
+                MinTemp.degC. = (MinTemp.degF.- 32)*5/9,
+                Precip.mm. = Precip.inches.*25.4)
+  
+
+# Define a function to calculate GDD
+calculate_gdd <- function(MinTemp.degC., MaxTemp.degC., base_temp = 10) {
+  MinTemp.degC. <- ifelse(MinTemp.degC. < base_temp, base_temp, MinTemp.degC.)
+  MaxTemp.degC. <- ifelse(MaxTemp.degC. < base_temp, base_temp, MaxTemp.degC.)
+  gdd <- ((MaxTemp.degC. + MinTemp.degC.) / 2) - base_temp
+  return(max(gdd, 0))
+}
+
+# 0. Compare gdd and precip. accumulation rates 
+weather_averages <- weather %>%
+  # change temp to degrees C and precip to mm
+  dplyr::mutate(MaxTemp.degC. = (MaxTemp.degF.- 32)*5/9,
+                MinTemp.degC. = (MinTemp.degF.- 32)*5/9,
+                Precip.mm. = Precip.inches.*25.4) %>%
+  # filter to growing season
+  dplyr::mutate(Month = format(Date, "%m")) %>%
+  filter(Month %in% c("05", "06", "07", "08", "09")) %>%
+  # filter to 1963 - 2011 data
+  filter(year(Date) < 2011) %>% 
+  # change temp to degrees C and precip to mm
+  dplyr::mutate(MaxTemp.degC. = (MaxTemp.degF.- 32)*5/9,
+                MinTemp.degC. = (MinTemp.degF.- 32)*5/9,
+                Precip.mm. = Precip.inches.*25.4) %>%
+  # calculate GDD
+  mutate(GDD = mapply(calculate_gdd, MinTemp.degC., MaxTemp.degC.)) %>%
+  # summarize by year initially...
+  group_by(Year = year(Date)) %>%
+  summarize(Cumulative_GDD = sum(GDD, na.rm = TRUE),
+            Total_Precipitation_mm = sum(Precip.mm., na.rm = TRUE)
+            ) %>% 
+  arrange(Year) %>%
+  # then take averages across timeframe
+  ungroup() %>%
+  dplyr::summarize(Cumulative_GDD_avg1963_2011 = mean(Cumulative_GDD),
+                   Total_Precipitation_mm_avg1963_2011 = mean(Total_Precipitation_mm),
+                   
+                    n = n(),
+        
+                    mean_gdd = mean(Cumulative_GDD, na.rm = TRUE),
+                    se_gdd = sd(Cumulative_GDD, na.rm = TRUE) / sqrt(n()),
+        
+                    mean_precip = mean(Total_Precipitation_mm, na.rm = TRUE),
+                    se_precip = sd(Total_Precipitation_mm, na.rm = TRUE) / sqrt(n())
+                   )
+  
+
+# Calculate GDD and GDD with temperature treatment for each day
+weather_gdd <- weather_filtered %>%
+  mutate(GDD = mapply(calculate_gdd, MinTemp.degC., MaxTemp.degC.)) 
+
+# year effects
+cumulative_gdd_year <- weather_gdd %>%
+  group_by(Year = year(Date)) %>%
+  summarize(Cumulative_GDD = sum(GDD, na.rm = TRUE),
+            Total_Precipitation_mm = sum(Precip.mm., na.rm = TRUE)
+            ) %>%
+  arrange(Year) %>%
+  mutate(GDD_diff_from_histAvg = Cumulative_GDD - weather_averages$Cumulative_GDD_avg1963_2011,
+         Precip_diff_from_histAvg = Total_Precipitation_mm - weather_averages$Total_Precipitation_mm_avg1963_2011) %>%
+  # Ensure Year is a factor with descending levels
+  mutate(Year = factor(Year, levels = sort(unique(Year), decreasing = TRUE)))
+
+# growing season effects
+cumulative_gdd_gs <- weather_gdd %>%
+  mutate(Month = month(Date)) %>%
+  filter(Month %in% c(5, 6, 7, 8, 9)) %>%
+  dplyr::select(-c(Month)) %>%
+  group_by(Year = year(Date)) %>%
+  summarize(Cumulative_GDD = sum(GDD, na.rm = TRUE),
+            Total_Precipitation_mm = sum(Precip.mm., na.rm = TRUE) 
+            ) %>%
+  arrange(Year) %>%
+  mutate(GDD_diff_from_histAvg = Cumulative_GDD - weather_averages$Cumulative_GDD_avg1963_2011,
+         Precip_diff_from_histAvg = Total_Precipitation_mm - weather_averages$Total_Precipitation_mm_avg1963_2011) %>%
+  # Ensure Year is a factor with descending levels
+  mutate(Year = factor(Year, levels = sort(unique(Year), decreasing = TRUE)))
+
+
+# View the resulting datasets
+print("Cumulative GDD and Precipitation by Year")
+print(cumulative_gdd_year)
+
+# Create a dataset with cumulative GDD and total precipitation by month and year
+cumulative_gdd_month_year <- weather_gdd %>%
+  group_by(Year = year(Date), Month = month(Date)) %>%
+  summarize(Cumulative_GDD = sum(GDD),
+            #Cumulative_GDD_Treatment = sum(GDD_Temp.Treatment, na.rm = TRUE),
+            Total_Precipitation_mm = sum(Precip.mm.) #,
+            #Total_Precipitation = sum(PRCP_Water.Treatment, na.rm = TRUE)
+            ) %>%
+  arrange(Year, Month)
+
+# View the resulting datasets
+print("Cumulative GDD and Precipitation by Year")
+print(cumulative_gdd_year)
+
+# precip by year
+cumulative_gdd_month_year_plot <- cumulative_gdd_month_year %>%
+  mutate(YearCat = as.factor(Year)) %>%
+  ungroup() %>%
+  group_by(Year) %>%
+  mutate(Cumulative_Precipitation = cumsum(Total_Precipitation_mm),
+         Cumulative_GDD = cumsum(Cumulative_GDD)) %>%
+  arrange(Month)
+
+cumulative_gdd_month_year_plot <- cumulative_gdd_month_year_plot %>%
+  filter(Month < 11)
+# Plot A: Growing Degree Day Accumulation
+gdd_accumulation_yr <- ggplot(cumulative_gdd_month_year_plot, aes(x = Month)) +
+  geom_point(aes(y = Cumulative_GDD, col = YearCat), size = 3, shape = 16) +
+  geom_line(aes(y = Cumulative_GDD, group = YearCat, col = YearCat), size = 1) +
+  labs(title = "A",
+       x = "Month", y = "Growing Degree Day Accumulation") +
+  scale_color_viridis(option = "F", discrete = TRUE, name = "Year") +
+  scale_x_discrete(limits = c("Jan","Feb","Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct")) +  
+  theme_minimal() +
+  theme(legend.position = "none",  # Show legend to differentiate years
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Plot C: Total Precipitation Accumulation
+precip_accumulation_yr <- ggplot(cumulative_gdd_month_year_plot, aes(x = Month)) +
+  geom_point(aes(y = Cumulative_Precipitation, col = YearCat), size = 3, shape = 16) +
+  geom_line(aes(y = Cumulative_Precipitation, group = YearCat, col = YearCat), size = 1) +
+  labs(title = "C",
+       x = "Month", y = "Precipitation Accumulation (mm)") +
+  scale_color_viridis(option = "G", discrete = TRUE, name = "Year") +
+ scale_x_discrete(limits = c("Jan","Feb","Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct")) +
+  theme_minimal() +
+  theme(legend.position = "none",  # Show legend to differentiate years
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Plot cumulative GDD by Year
+gdd_year_plot <- ggplot(cumulative_gdd_year, aes(x = factor(Year), y = Cumulative_GDD, fill = factor(Year))) +
+  geom_bar(stat = "identity", alpha = 0.7, 
+           col = "black",
+           width = 0.5) +
+  labs(
+      title = "B",
+       x = "Year", y = "Total Growing Degree Days",
+       fill = "Year") +
+  theme_minimal() +
+  scale_fill_viridis(option = "F", discrete = TRUE, name = "Year") +
+  theme(legend.position = "right",
+        legend.title = element_text(size = 10),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Plot cumulative precip by Year
+precip_year_plot <- ggplot(cumulative_gdd_year, aes(x = factor(Year), y = Total_Precipitation_mm, fill = factor(Year))) +
+  geom_bar(stat = "identity", alpha = 0.7,
+           col = "black", width = 0.5) +
+  labs(
+       title = "D",
+       x = "Year", y = "Total Growing Season Precipitation (mm)",
+       fill = "Year") +
+  theme_minimal() +
+  scale_fill_viridis(option = "G", discrete = TRUE, name = "Year") + 
+  theme(legend.position = "right",
+        legend.title = element_text(size = 10),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Display the plots
+ggarrange(gdd_accumulation_yr,gdd_year_plot,precip_accumulation_yr,precip_year_plot) 
+
+# SPEI graph
+spei2$SPEI_4cat <- factor(spei2$SPEI_4cat, levels = c("Extremely wet", "Wet", "Normal", "Dry", "Extremely dry")) # formerly spei
+spei2 %>% # formerly spei
+  mutate(Year = as.numeric(Year)) %>%
+  ggplot(., aes(x = factor(Year), y = SPEI04, fill = SPEI_4cat)) +
+  geom_bar(stat = "identity", col = "black", width = 0.5) +
+  labs(
+    title = "E",
+    x = "Year", y = "SPEI index value (May - August)",
+    fill = "SPEI category") +
+  geom_hline(yintercept = 0) +
+  theme_minimal() +
+  scale_fill_manual(values = c("Extremely wet" = "#1f78b4", "Wet" = "#a6cee3", "Normal" = "#ffffff", "Dry" = "#eaa082", "Extremely dry" = "#c62a15")) +
+  theme(legend.position = "right",
+        legend.title = element_text(size = 10),
+        axis.text.x = element_text(angle = 45, hjust = 1)) + scale_x_discrete(limits = as.character(2012:2023))
+
+
+# Calculate mean and standard error for GDD and GDD_Temperature by month
+cumulative_gdd_summary <- cumulative_gdd_month_year %>%
+  group_by(Month) %>%
+  summarize(
+    mean_GDD = mean(Cumulative_GDD, na.rm = TRUE),
+    se_GDD = sd(Cumulative_GDD, na.rm = TRUE) / sqrt(n())
+  )
+
+# Plot difference from historical (1963 - 2011) average
+
+# Extract reference values
+gdd_ref <- weather_averages$Cumulative_GDD_avg1963_2011
+precip_ref <- weather_averages$Total_Precipitation_mm_avg1963_2011
+
+# Create GDD difference plot
+gdd_plot <- ggplot(cumulative_gdd_gs, aes(x = GDD_diff_from_histAvg, y = Year, fill = GDD_diff_from_histAvg)) +
+  geom_col(color = "black") +
+  xlim(-300, 300) +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  scale_y_discrete(limits = rev(levels(cumulative_gdd_gs$Year))) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+  labs(
+    x = "GDD Difference from Historical Average",
+    y = "Year"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+gdd_plot_allyrs <- cumulative_gdd_gs %>%
+  ungroup() %>%
+  dplyr::select(-c(Year)) %>%
+  mutate(Year = rep("    All")) %>%
+  group_by(Year) %>%
+  dplyr::summarize(GDD_diff_from_histAvg = mean(GDD_diff_from_histAvg)) %>%
+  ggplot(., aes(x = GDD_diff_from_histAvg, y = Year)) +
+  geom_col(color = "black",fill = "#FFF0F0") +
+  xlim(-300, 300) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+  labs(
+    x = "Average GDD Difference, 2012 - 2023",
+    y = ""
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+# Create Precipitation difference plot
+precip_plot <- ggplot(cumulative_gdd_gs, aes(x = Precip_diff_from_histAvg, y = Year, fill = Precip_diff_from_histAvg)) +
+  geom_col(color = "black") +
+  xlim(-300, 300) +
+  scale_fill_gradient2(low = "darkgoldenrod3", mid = "white", high = "turquoise3", midpoint = 0) +
+  scale_y_discrete(limits = rev(levels(cumulative_gdd_gs$Year))) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+  labs(
+   # title = "Growing Season Precipitation Difference from Historical Average",
+    x = "Precipitation Difference (mm) from Historical Average",
+    y = ""
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+precip_plot_allyrs <- cumulative_gdd_gs %>%
+  ungroup() %>%
+  dplyr::select(-c(Year)) %>%
+  mutate(Year = rep("    All")) %>%
+  group_by(Year) %>%
+  dplyr::summarize(Precip_diff_from_histAvg = mean(Precip_diff_from_histAvg)) %>%
+  ggplot(., aes(x = Precip_diff_from_histAvg, y = Year)) +
+  geom_col(color = "black",fill = "#F7F0E1") +
+  xlim(-300, 300) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+  labs(
+    x = "Average Precipitation Difference (mm), 2012 - 2023",
+    y = ""
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+# arrange all plots
+grid.arrange(gdd_plot, precip_plot, gdd_plot_allyrs, precip_plot_allyrs, heights=c(0.83, 0.17), nrow=2)
+
+# end climate info 2
+```
+[Back to Index](#index)
+
+#### GDD by species {#sps_gdd}
+```{r}
+head(weather_gdd)
+
+# calculate day of the year from weather dataset
+weather_gdd2 <- weather_gdd %>%
+  group_by(Year = year(Date)) %>%
+  dplyr::mutate(doy = yday(Date),
+                YearCat = as.character(Year),
+                cumulative_GDD = cumsum(GDD),
+                cumulative_precip = cumsum(Precip.mm.))
+
+# Filter to get the lowest value of "start" per year for each combination of Species.observed, treatment, and cumulative_GDD
+df_filtered_start <- df2 %>%
+  dplyr::select(start, Year, Species.observed, CO2.Treatment, N.Treatment, Water.Treatment, Temp.Treatment, Phase) %>%
+  group_by(Year, Species.observed, CO2.Treatment, N.Treatment, Water.Treatment, Temp.Treatment, Phase) %>%
+  filter(CO2.Treatment == "ambient CO2",
+         N.Treatment == "ambient N",
+         Temp.Treatment == "HTamb",
+         Water.Treatment == "H2Oamb") %>%
+  summarize_all(mean) %>%
+  ungroup() %>%
+  left_join(., weather_gdd2[, c("doy","YearCat","cumulative_GDD","cumulative_precip")], by = c("Year"="YearCat","start"="doy"))
+
+df_filtered_end <- df2 %>%
+  dplyr::select(end, Year, Species.observed, CO2.Treatment, N.Treatment, Water.Treatment, Temp.Treatment, Phase) %>%
+  group_by(Year, Species.observed, CO2.Treatment, N.Treatment, Water.Treatment, Temp.Treatment, Phase) %>%
+  filter(CO2.Treatment == "ambient CO2",
+         N.Treatment == "ambient N",
+         Temp.Treatment == "HTamb",
+         Water.Treatment == "H2Oamb") %>%
+  summarize_all(mean) %>%
+  ungroup() %>%
+  left_join(., weather_gdd2[, c("doy","YearCat","cumulative_GDD","cumulative_precip")], by = c("Year"="YearCat","end"="doy"))
+
+# Create the ggplot
+            phase.labs <- c("Leaves", "Open Flowers", "Ripe Fruits")
+            names(phase.labs) <- c("Leaves", "OpenFlowers", "RipeFruits")
+start_ctrl <- ggplot(df_filtered_start, aes(y = cumulative_GDD, x = start, fill = Species.observed)) +
+  geom_point(alpha = 0.5, size = 2, pch = 21) +
+  facet_wrap(~ Phase, ncol = 1, scales = "free_y", labeller = labeller(Phase = phase.labs)) +
+  labs(
+       y = "Cumulative GDD",
+       x = "Start (DOY)",
+       color = "Species") +
+  scale_fill_viridis(option = "H", discrete = T,
+                     labels = c(expression(italic("Agropyron repens")),
+                                expression(italic("Andropogon gerardii")),
+                                expression(italic("Bromus inermis")),
+                                expression(italic("Lespedeza capitata")),
+                                expression(italic("Lupinus perennis")),
+                                expression(italic("Poa pratensis")),
+                                expression(italic("Schizachyrium scoparium")),
+                                expression(italic("Solidago rigida")))) +
+   theme(
+    panel.border = element_rect(color = "black", fill = NA),
+    panel.background = element_rect(fill = "white"),
+    plot.background = element_rect(fill = "white"),
+    panel.grid.major = element_line(color = "grey90", size = 0.25),
+    panel.grid.minor = element_blank(),
+    strip.background.x=element_rect(color = NA,  fill=NA), 
+    strip.background.y=element_rect(color = "black",  fill=NA),
+    strip.text = element_text(size = 10, face = "bold"),
+    plot.title = element_text(hjust = 0.5),
+    axis.title = element_text(size = 12), 
+    legend.position = "right",
+    legend.text.align = 0,
+    legend.background = element_rect(fill = "white"),
+    legend.title = element_text()
+  );start_ctrl
+end_ctrl <- ggplot(df_filtered_end, aes(y = cumulative_GDD, x = end, fill = Species.observed)) +
+  geom_point(alpha = 0.5, size = 2, pch = 21) +
+  facet_wrap(~ Phase, ncol = 1, scales = "free_y", labeller = labeller(Phase = phase.labs)) +
+  labs(
+       y = "",
+       x = "End (DOY)",
+       color = "Species") +
+  scale_fill_viridis(option = "H", discrete = T,
+                     labels = c(expression(italic("Agropyron repens")),
+                                expression(italic("Andropogon gerardii")),
+                                expression(italic("Bromus inermis")),
+                                expression(italic("Lespedeza capitata")),
+                                expression(italic("Lupinus perennis")),
+                                expression(italic("Poa pratensis")),
+                                expression(italic("Schizachyrium scoparium")),
+                                expression(italic("Solidago rigida")))) +
+  theme(
+    panel.border = element_rect(color = "black", fill = NA),
+    panel.background = element_rect(fill = "white"),
+    plot.background = element_rect(fill = "white"),
+    panel.grid.major = element_line(color = "grey90", size = 0.25),
+    panel.grid.minor = element_blank(),
+    strip.background.x=element_rect(color = NA,  fill=NA), 
+    strip.background.y=element_rect(color = "black",  fill=NA),
+    strip.text = element_text(size = 10, face = "bold"),
+    plot.title = element_text(hjust = 0.5),
+    axis.title = element_text(size = 12), #face = "bold"
+    legend.position = "right",
+    legend.text.align = 0,
+    legend.background = element_rect(fill = "white"),
+    legend.title = element_text()
+  )
+ggarrange(start_ctrl, end_ctrl, ncol = 2, common.legend = TRUE, legend = "right")
+```
+[Back to Index](#index)
+
+#### main treatment effects (only) on individual species (regardless of year) {#sps_trt}
+```{r}
+# Step 1: Generate a New Datasets for Predictions
+    # Create a new datasets for predictions
+    newdat_sp <- expand.grid(
+          Temp.Treatment = c("HTamb", "HTelv"),
+          Water.Treatment = c("H2Oamb", "H2Oneg"),
+          CO2.Treatment = c("ambient CO2", "+CO2"),
+          N.Treatment = c("ambient N", "+N")
+        ) %>% # now we can tailor this dataset 
+        mutate(
+        # add treatment combo column
+        Treatment_Combo = case_when(
+          Temp.Treatment == "HTelv" & Water.Treatment == "H2Oamb" & CO2.Treatment == "ambient CO2" & N.Treatment == "ambient N" ~ "+T",
+          Temp.Treatment == "HTamb" & Water.Treatment == "H2Oneg" & CO2.Treatment == "ambient CO2" & N.Treatment == "ambient N" ~ "-W",
+          Temp.Treatment == "HTamb" & Water.Treatment == "H2Oamb" & CO2.Treatment == "+CO2" & N.Treatment == "ambient N" ~ "+C",
+          Temp.Treatment == "HTamb" & Water.Treatment == "H2Oamb" & CO2.Treatment == "ambient CO2" & N.Treatment == "+N" ~ "+N",
+          Temp.Treatment == "HTamb" & Water.Treatment == "H2Oamb" & CO2.Treatment == "ambient CO2" & N.Treatment == "ambient N" ~ "Ctrl", # All ambient
+          TRUE ~ paste0(
+            ifelse(Temp.Treatment == "HTelv", "+T", ""),
+            ifelse(Water.Treatment == "H2Oneg", "-W", ""),
+            ifelse(CO2.Treatment == "+CO2", "+C", ""),
+            ifelse(N.Treatment == "+N", "+N", "")
+          )
+        )
+      ) %>%
+      # remove instances of 3 & 4-way interactions
+      mutate(
+        non_ambient_count = rowSums(data.frame(
+          Temp.Treatment != "HTamb",
+          Water.Treatment != "H2Oamb",
+          CO2.Treatment != "ambient CO2",
+          N.Treatment != "ambient N"
+        ))
+      ) %>%
+      filter(non_ambient_count <= 1) %>% # Keep only rows with <= 1 non-ambient variables
+      dplyr::select(-non_ambient_count) # Drop the helper column
+
+# Step 2: Define the levels for each factor
+phases <- c("Leaves", "OpenFlowers", "RipeFruits")
+measures <- c("start", "sqrt_end_rev")  # Updated measures
+species <- c("agrre", "andge", "broin", "lesca", "luppe", "poapr", "schsc", "solri")
+
+# Create an empty dataframe to store all results
+newdata_all_models <- data.frame()
+
+# Step 3: Loop through all combinations of phase, measure, and species
+for (phase in phases) {
+  for (measure in measures) {
+    for (sp in species) {
+      
+      # (1) Subset data
+      df_subset <- subset(df2, Phase == phase & Species.observed == sp)
+
+      # Skip if no data available for this combination
+      if (nrow(df_subset) == 0) next
+
+      # (2) Assign the correct family
+      if (measure == "sqrt_end_rev") {
+        family_type <- Gamma(link = "log")
+      } else {
+        family_type <- poisson()
+      }
+
+      # (3) Fit the model
+      model <- glmer(
+        as.formula(paste0(measure, " ~ Temp.Treatment + Water.Treatment + CO2.Treatment + N.Treatment + 
+                           (1 | ExpYrCat) + (1 | Ring:Plot)")),
+        data = df_subset,
+        family = family_type
+      )
+
+      # (4) Generate Model Matrix for New Data
+      fixed_formula <- reformulate(attr(terms(model), "term.labels"))  
+      X <- model.matrix(fixed_formula, newdat_sp)
+
+      # Extract Fixed Effect Estimates and Variance-Covariance Matrix
+      beta_hat <- fixef(model)  
+      vcov_beta <- vcov(model)  
+
+      # Compute Predictions and Standard Errors
+      link_predictions <- X %*% beta_hat  
+      link_se <- sqrt(diag(X %*% vcov_beta %*% t(X)))  
+
+      # (5) Adjust transformation based on measure type
+      if (measure == "sqrt_end_rev") {
+        newdat_temp <- newdat_sp %>%
+          mutate(
+            link_se = (exp(link_se))^2,
+            predicted = 365 - (exp(link_predictions))^2 - 1,
+            Measure = measure,
+            Phase = phase,
+            Species = sp
+          )
+      } else {  # Default Poisson transformations for "start"
+        newdat_temp <- newdat_sp %>%
+          mutate(
+            link_se = exp(link_se),
+            predicted = exp(link_predictions),
+            lower = exp(link_predictions - 1.96 * link_se),
+            upper = exp(link_predictions + 1.96 * link_se),
+            Measure = measure,
+            Phase = phase,
+            Species = sp
+          )
+      }
+
+      # (6) Verify Predictions Using predict()
+      newdat_temp <- newdat_temp %>%
+        mutate(
+          predict_check = predict(model, newdata = newdat_sp, type = "response", re.form = NA)
+        )
+
+      # Append to the main dataframe
+      newdata_all_models <- bind_rows(newdata_all_models, newdat_temp)
+    }
+  }
+}
+
+# View final combined dataframe
+head(newdata_all_models) 
+
+# Step 4: Plotz
+        newdata_all_models$Measure <- factor(newdata_all_models$Measure, levels = c("start", "sqrt_end_rev"))
+        # labels for plots
+        Phase.labs <- c("Leaves", "Open Flowers", "Ripe Fruits")
+        names(Phase.labs) <- c("Leaves", "OpenFlowers", "RipeFruits")
+         
+        Measure.labs <- c("Start", "End")
+        names(Measure.labs) <- c("start", "sqrt_end_rev")
+
+# Custom vectors for the new labels
+newdata_all_models$Species <- factor(newdata_all_models$Species, levels = c("andge","broin","agrre","lesca","luppe","poapr","schsc","solri"))
+ 
+species_labels <- c(
+  andge = expression(italic("A. gerardii")),
+  broin = expression(italic("B. inermis")),
+  agrre = expression(italic("E. repens")),
+  lesca = expression(italic("L. capitata")),
+  luppe = expression(italic("L. perennis")),
+  poapr = expression(italic("P. pratensis")),
+  schsc = expression(italic("S. scoparium")),
+  solri = expression(italic("S. rigida"))
+)
+
+treatment_colors <- c(
+  "Ctrl" = "black",        # Black
+  "+T" = "firebrick1", # Dark red
+  "+C" = "grey50",  # Grey
+  "-W" = "cornflowerblue",# Medium blue
+  "+N" = "palegreen3"     # Medium sea green
+)
+
+# Reorder TrtCombo levels
+newdata_all_models$Treatment_Combo <- factor(newdata_all_models$Treatment_Combo, levels = c("Ctrl", "+T", "-W", "+C", "+N"))
+
+# Create model/response column
+newdata_all_models$Model0 <- paste(newdata_all_models$Phase, newdata_all_models$Measure, sep = " ")
+
+# Reorder model levels
+newdata_all_models <- newdata_all_models %>%
+  mutate(Model = ifelse(Model0 == "Leaves start", "Start of Leaves",
+                        ifelse(Model0 == "OpenFlowers start", "Start of Flowers",
+                               ifelse(Model0 == "RipeFruits start", "Start of Fruits",
+                                      ifelse(Model0 == "Leaves sqrt_end_rev", "End of Leaves",
+                                             ifelse(Model0 == "OpenFlowers sqrt_end_rev", "End of Flowers",
+                                                    ifelse(Model0 == "RipeFruits sqrt_end_rev", "End of Fruits", Model0)))))))
+
+newdata_all_models$Model <- factor(newdata_all_models$Model , levels = c("Start of Leaves", "Start of Flowers", "Start of Fruits", "End of Leaves", "End of Flowers", "End of Fruits"))
+
+# Plotting
+pacman::p_load(patchwork)
+
+newdata_all_models %>%
+  split(~Species) %>%  # Split by Species
+  lapply(function(.data) {
+    x_title <- unique(.data$Species)
+
+    # Remove strip labels for all but the last facet
+    remove_strip_x <- if (x_title != last(unique(newdata_all_models$Species))) 
+      theme(strip.text.x = element_blank()) else theme()
+
+    ggplot(.data, aes(y = Treatment_Combo, x = predicted, color = Treatment_Combo)) +
+      geom_point(position = position_dodge(0.75), size = 1.5) +
+      geom_errorbar(aes(xmin = predicted - link_se, xmax = predicted + link_se), 
+                    position = position_dodge(0.5), width = 0) +
+      #labs(y = x_title) +  # Move label to y-axis instead of strip
+      ylab(species_labels[[x_title]]) +
+      facet_wrap(
+        facets = vars(Model),  # Facet by Model
+        scales = "free_x",  # Allow different x-scales per facet
+        nrow = 1,
+        strip.position = "bottom",
+        labeller = labeller(Species = as_labeller(species_labels))
+      ) +
+      annotate("segment", x = -Inf, xend = Inf, y = -Inf, yend = -Inf) +
+      annotate("segment", x = -Inf, xend = -Inf, y = -Inf, yend = Inf) +
+      scale_color_manual(values = treatment_colors) +
+      theme_minimal() +
+      theme(
+        panel.grid.minor = element_blank(),
+        panel.border = element_rect(colour = "black", fill = NA, size = 0.5),
+        plot.subtitle = element_text(hjust = 0.5), 
+        strip.text = element_text(size = 10, face = "bold"),
+        legend.position = "none"
+      ) +
+      remove_strip_x  # Apply strip text removal conditionally
+  }) %>%
+  wrap_plots(ncol = 1) &  # Stack plots vertically  
+  theme(
+    strip.text = element_text(size = 10, face = "bold"),  # Facet label (strip) text size
+    axis.text.x = element_text(size = 7, angle = 90),
+    axis.text.y = element_text(size = 8),  # Y-axis tick text size
+    axis.title.x = element_blank(),
+    legend.title = element_blank(),
+    panel.spacing = unit(2, "lines"),
+    strip.placement = "outside",
+    strip.switch.pad.wrap = unit(0, "lines")
+  )
+```
+[Back to Index](#index)
+
+#### year effects on individual species (regardless of treatment) {#sps_yr}
+```{r}
+df_raw_sp_yr <- df2 %>%
+  ungroup() %>%
+  dplyr::select(Year, Species.observed, Phase, start, end) %>%
+  mutate(Phase = ifelse(Phase == "Leaves", "leaves",
+                        ifelse(Phase == "OpenFlowers", "flowers",
+                               ifelse(Phase == "RipeFruits", "fruits", NA)))) %>%
+  rename(Start = start,
+         End = end) %>%
+  pivot_longer(col = c(Start:End), names_to = "Measure", values_to = "doy") %>%
+  mutate(Response = paste(Measure, Phase, sep = " of ")) %>%
+  dplyr::select(-c(Phase, Measure)) %>%
+  group_by(Species.observed, Response, Year) %>%
+  summarize_all(mean, na.rm = TRUE) %>%
+  pivot_wider(names_from = Response, values_from = doy) %>% #%>% filter(Year != "2012")
+  as.data.frame()
+  
+write.csv(df_raw_sp_yr, "YearEffects_PhaseMeasure_inc2023.csv")
+
+
+# Plotting
+pacman::p_load(patchwork)
+
+df_raw_sp_yr %>%
+  pivot_longer(cols = `End of flowers`:`Start of leaves`, names_to = "Response", values_to = "DOY") %>%
+  split(~Species.observed) %>%  # Split by Species
+  lapply(function(.data) {
+    x_title <- unique(.data$Species.observed)
+
+    # Remove strip labels for all but the last facet
+    remove_strip_x <- if (x_title != last(unique(df_raw_sp_yr$Species.observed))) 
+      theme(strip.text.x = element_blank()) else theme()
+
+    ggplot(.data, aes(y = Year, x = DOY, color = "black")) +
+      geom_point(position = position_dodge(0.75), size = 1.5) + 
+      stat_summary(fun.data = mean_se,  geom = "errorbar", width = 0, size = 0.5, position = position_dodge(width = 0.5)) +
+      stat_summary(fun=mean,geom="point", size=0.25,position = position_dodge(width = 0.5)) +
+      # geom_errorbar(aes(xmin = predicted - link_se, xmax = predicted + link_se), 
+      #               position = position_dodge(0.5), width = 0.2) +
+      labs(y = x_title) +  # Move label to y-axis instead of strip
+      facet_wrap(
+        facets = vars(Response),  # Facet by Model
+        scales = "free_x",  # Allow different x-scales per facet
+        nrow = 1,
+        strip.position = "bottom",
+        labeller = labeller(Species = as_labeller(species_labels, label_parsed))
+      ) +
+      annotate("segment", x = -Inf, xend = Inf, y = -Inf, yend = -Inf) +
+      annotate("segment", x = -Inf, xend = -Inf, y = -Inf, yend = Inf) +
+      scale_color_manual(values = treatment_colors) +
+      theme_minimal() +
+      theme(
+        panel.grid.minor = element_blank(),
+        panel.border = element_rect(colour = "black", fill = NA, size = 0.5),
+        plot.subtitle = element_text(hjust = 0.5), 
+        strip.text = element_text(size = 10, face = "bold"),
+        legend.position = "none"
+      ) +
+      remove_strip_x  # Apply strip text removal conditionally
+  }) %>%
+  wrap_plots(ncol = 1) &  # Stack plots vertically  
+  theme(
+    strip.text = element_text(size = 10, face = "bold"),  # Facet label (strip) text size
+    axis.text.x = element_text(size = 7, angle = 90), # , hjust = 0.7
+    axis.text.y = element_text(size = 8),  # Y-axis tick text size
+    axis.title.x = element_blank(),
+    legend.title = element_blank(),
+    panel.spacing = unit(2, "lines"),
+    strip.placement = "outside",
+    strip.switch.pad.wrap = unit(0, "lines")
+  )
+```
+[Back to Index](#index)
+
+#### soil moisture plots {#soil_m}
+*Note: this chunk takes a long time to run*
+```{r}
+head(sm)
+
+# wrangle data
+sm9 <- sm %>%
+  # filter
+  filter(CountOfSpecies == 9) %>%
+  # reorganize date
+  mutate(
+        Date = as.Date(Date, "%m/%d/%Y"),
+        Year = as.numeric(format(Date, "%Y")),
+        Month = as.numeric(format(Date, "%m")),
+        Day = as.numeric(format(Date, "%d"))) %>%
+  dplyr::select(Date, Year, Month, Day, Ring, Plot, CountOfSpecies, Temp.Treatment, Water.Treatment, CO2.Treatment, N.Treatment, Method, Proportion.Soil.Moisture..0.17.cm., Proportion.Soil.Moisture..0.20.cm., Proportion.Soil.Moisture..22.39.cm.) %>%
+  # pivot
+  pivot_longer(cols = c(Proportion.Soil.Moisture..0.17.cm., Proportion.Soil.Moisture..0.20.cm., Proportion.Soil.Moisture..22.39.cm.), names_to = "depth", values_to = "prop_soil_m") %>%
+  mutate(depth = ifelse(depth == "Proportion.Soil.Moisture..0.17.cm.", "0.17.cm",
+                 ifelse(depth == "Proportion.Soil.Moisture..0.20.cm.", "0.20.cm",
+                 ifelse(depth == "Proportion.Soil.Moisture..22.39.cm.", "22.39.cm", NA)))) %>%
+  # filter
+  filter(prop_soil_m != 0) %>%
+  filter(!is.na(prop_soil_m)) %>%
+  filter(Year >= 2012) %>%
+  filter(Temp.Treatment != "") %>%
+  # fix bugs
+  mutate(N.Treatment = ifelse(N.Treatment == "NNenrichrich", "+N", 
+                              ifelse(N.Treatment == "Namb", "ambient N", "")),
+         CO2.Treatment = ifelse(CO2.Treatment == "Cenrich", "+CO2",
+                                ifelse(CO2.Treatment == "Camb", "ambient CO2", ""))) %>%
+  as.data.frame() %>%
+  mutate(ExpYrCat = as.factor(-1*(2011-Year)))
+
+a<-sm9 %>%
+  ungroup() %>%
+  group_by(ExpYrCat) %>%
+  dplyr::select(ExpYrCat, Temp.Treatment, Water.Treatment, prop_soil_m, Year, Month) %>%
+  pivot_wider(names_from = c("Temp.Treatment","Water.Treatment"), values_from = "prop_soil_m", values_fn = mean) %>%
+  filter(!is.na(HTamb_)) %>%
+  # probably a better way to do this...
+  mutate(`-Water` = -(HTamb_H2Oamb - HTamb_H2Oneg),
+         `+Heat` = -(HTamb_H2Oamb - HTelv_H2Oamb),
+         `+Heat-Water` = -(HTamb_H2Oamb - HTelv_H2Oneg)) %>%
+  dplyr::select(ExpYrCat, Year, Month, `-Water`, `+Heat`, `+Heat-Water`) %>%
+  pivot_longer(cols = c(`-Water`, `+Heat`, `+Heat-Water`), names_to = "Treatment_effect", values_to = "soil_moisture_prop")
+
+sm9 %>%
+  ungroup() %>%
+  group_by(ExpYrCat) %>%
+  dplyr::select(ExpYrCat, Temp.Treatment, Water.Treatment, prop_soil_m, Year, Month) %>%
+  pivot_wider(names_from = c("Temp.Treatment","Water.Treatment"), values_from = "prop_soil_m", values_fn = mean) %>%
+  filter(!is.na(HTamb_)) %>%
+  mutate(Month = ifelse(Month == 4, "Apr",
+                        ifelse(Month == 5, "May", 
+                               ifelse(Month == 6, "Jun", 
+                                      ifelse(Month == 7, "Jul", 
+                                             ifelse(Month == 8, "Aug",
+                                                    ifelse(Month == 9, "Sep", NA)))))),
+         Month = factor(Month, levels = c("Apr", "May", "Jun", "Jul", "Aug", "Sep"))) %>%
+  # probably a better way to do this...
+  mutate(`-Water` = -(HTamb_H2Oamb - HTamb_H2Oneg),
+         `+Heat` = -(HTamb_H2Oamb - HTelv_H2Oamb),
+         `+Heat-Water` = -(HTamb_H2Oamb - HTelv_H2Oneg)) %>%
+  dplyr::select(ExpYrCat, Year, Month, `-Water`, `+Heat`, `+Heat-Water`) %>%
+  pivot_longer(cols = c(`-Water`, `+Heat`, `+Heat-Water`), names_to = "Treatment_effect", values_to = "soil_moisture_prop") %>%
+ggplot(., aes(x = Month, y = soil_moisture_prop, col = Treatment_effect)) +
+  geom_point(alpha = 0.1) +
+  scale_color_manual(values = c("cornflowerblue", "firebrick1", "maroon4"), name = "Treatment effect") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  stat_summary(fun.data = mean_se,  geom = "errorbar", width = 0, size = 0.75, position = position_dodge(width = 0.5)) +
+  stat_summary(fun=mean,geom="point", size=2,position = position_dodge(width = 0.5)) +
+  theme_minimal() +
+  labs(x="Month", y = "Change in soil moisture prop. from ambient")
+
+################################################################################
+# run models
+################################################################################
+# april
+sm9_apr <- lmer(prop_soil_m ~ Temp.Treatment * Water.Treatment + (1|Ring:Plot) + (1|depth) + (1|Year), data = subset(sm9, Month == 4)); anova(sm9_apr)
+summary(sm9_apr)
+
+# may
+sm9_may <- lmer(prop_soil_m ~ Temp.Treatment * Water.Treatment + (1|Ring:Plot) + (1|depth) + (1|Year), data = subset(sm9, Month == 5)); anova(sm9_may)
+summary(sm9_may)
+
+# june
+sm9_jun <- lmer(prop_soil_m ~ Temp.Treatment * Water.Treatment + (1|Ring:Plot) + (1|depth) + (1|Year), data = subset(sm9, Month == 6)); anova(sm9_jun)
+summary(sm9_jun)
+
+# july
+sm9_jul <- lmer(prop_soil_m ~ Temp.Treatment * Water.Treatment + (1|Ring:Plot) + (1|depth) + (1|Year), data = subset(sm9, Month == 7)); anova(sm9_jul)
+summary(sm9_jul)
+
+# august
+sm9_aug <- lmer(prop_soil_m ~ Temp.Treatment * Water.Treatment + (1|Ring:Plot) + (1|depth) + (1|Year), data = subset(sm9, Month == 8)); anova(sm9_aug)
+summary(sm9_aug)
+
+# september
+sm9_sep <- lmer(prop_soil_m ~ Temp.Treatment * Water.Treatment + (1|Ring:Plot) + (1|depth) + (1|Year), data = subset(sm9, Month == 9)); anova(sm9_sep)
+summary(sm9_sep)
+
+################################################################################
+
+# Required libraries
+pacman::p_load(lme4,
+               car,
+               emmeans,
+               dplyr)
+
+# Initialize empty list to store results
+all_results <- list()
+
+# Loop over years 2012 to 2022
+for (yr in 2012:2022) {
+  
+  # Fit model for current year
+  model <- lmer(prop_soil_m ~ Temp.Treatment + (1|Ring/Plot) + (1|depth) + (1|Month),
+                data = subset(sm9, Year == yr))
+  
+  # Extract Anova table
+  aov_table <- Anova(model)
+  aov_df <- as.data.frame(aov_table)
+  aov_df$Effect <- rownames(aov_df)
+  rownames(aov_df) <- NULL
+  
+  print("aov_df"); print(aov_df)
+  
+  # Filter only Temp.Treatment row and rename
+  aov_extract <- aov_df %>%
+    filter(Effect == "Temp.Treatment") %>%
+    dplyr::select(Effect, Df, `Pr(>Chisq)`) %>%
+    rename(p_value = `Pr(>Chisq)`)
+  
+  print("aov_extract"); print(aov_extract)
+  
+  # Extract emmeans and SE
+  emm <- summary(emmeans(model, ~ Temp.Treatment))
+  
+  print("emm"); print(emm)
+  
+  # Combine emmeans output with Anova output
+  result_df <- emm %>%
+    mutate(Effect = "Temp.Treatment",
+           Df = aov_extract$Df[1],
+           p_value = aov_extract$p_value[1],
+           Year = yr) %>%
+    dplyr::select(Year, Effect, Temp.Treatment, emmean, SE, Df, p_value)
+  
+   print("result_df"); print(result_df)
+  
+  # Append to results list
+  all_results[[as.character(yr)]] <- result_df
+}
+
+# Combine all results into one dataframe
+final_df_1 <- bind_rows(all_results)
+
+# View or export final result
+print(final_df_1)
+
+final_df %>%
+  split(~Year) %>%  # Split by Species
+  lapply(function(.data) {
+    x_title <- unique(.data$Year)
+
+    # Remove strip labels for all but the last facet
+    remove_strip_x <- if (x_title != last(unique(final_df$Year))) 
+      theme(strip.text.x = element_blank()) else theme()
+
+    ggplot(.data, aes(y = Temp.Treatment, x = emmean, color = "black")) +
+      geom_point(position = position_dodge(0.75), size = 1.5) +
+      geom_errorbar(aes(xmin = emmean - SE, xmax = emmean + SE), 
+                    position = position_dodge(0.5), width = 0.2) +
+      labs(y = x_title) +  # Move label to y-axis instead of strip
+      annotate("segment", x = -Inf, xend = Inf, y = -Inf, yend = -Inf) +
+      annotate("segment", x = -Inf, xend = -Inf, y = -Inf, yend = Inf) +
+      scale_color_manual(values = treatment_colors) +
+      theme_minimal() +
+      theme(
+        panel.grid.minor = element_blank(),
+        panel.border = element_rect(colour = "black", fill = NA, size = 0.5),
+        plot.subtitle = element_text(hjust = 0.5), 
+        strip.text = element_text(size = 10, face = "bold"),
+        legend.position = "none"
+      ) +
+      remove_strip_x  # Apply strip text removal conditionally
+  }) %>%
+  wrap_plots(ncol = 1) &  # Stack plots vertically  
+  theme(
+    strip.text = element_text(size = 10, face = "bold"),  # Facet label (strip) text size
+    axis.text.x = element_text(size = 7, angle = 90), # , hjust = 0.7
+    axis.text.y = element_text(size = 8),  # Y-axis tick text size
+    axis.title.x = element_blank(),
+    legend.title = element_blank(),
+    panel.spacing = unit(2, "lines"),
+    strip.placement = "outside",
+    strip.switch.pad.wrap = unit(0, "lines")
+  )
+
+# end soil moisture calculations
+```
+
+# here's a garden if you stayed until the end
+```{r}
+    # Define the Unicode emojis
+    daisy <- "\U0001F33C"
+    tulip <- "\U0001F337"
+    cactus <- "\U0001F335"
+    camellia <- "\U0001F33A"
+    fern <- "\U0001F33F"
+    sunflower <- "\U0001F33B"
+    data <- "\U0001F4BE"
+    
+    # Print the emojis
+    cat(daisy, tulip, cactus, camellia, fern, sunflower, data, "\n")
+```
