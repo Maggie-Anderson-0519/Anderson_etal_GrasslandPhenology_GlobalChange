@@ -14,7 +14,6 @@ editor_options:
 [**Index**](#index)
 --
   * [Setup](#setup): load in data/libraries and set working directory
---- *The following three sections are not functional, but have been retained to show how raw data was manipulated. Will be updated to include raw data manipulations following publication* ---
   * [Data prep](#prep): prep data for phenology calculations 
   * [Phenology calculations](#phenoCalcs): phenology calculations; extract the first/last days of phenophase and length of phenophase time for each stage/subplot 
   * [Data wrangling](#wrangle): add treatment information, check for inconsistencies, fix variable names 
@@ -3465,4 +3464,5 @@ final_df %>%
     
     # Print the emojis
     cat(daisy, tulip, cactus, camellia, fern, sunflower, data, "\n")
+
 ```
